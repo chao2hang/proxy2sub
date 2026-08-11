@@ -2,6 +2,12 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-08-12
+
+### Fixed
+
+- **Hysteria2 节点带 `pinSHA256` 证书指纹参数时测活全部误判 dead**：`parseHysteria2` 此前未解析 `pinSHA256`，sing-box 配置也缺证书指纹字段，导致自签证书节点按系统 CA 校验必然失败（`x509: certificate signed by unknown authority`）。现已解析并在 sing-box 测活配置中输出 `certificate_public_key_sha256`，命中后 sing-box 自动改用 SPKI 指纹校验（与 Hysteria2 官方 `pinSHA256` 语义一致），比 `insecure: true` 更安全——指纹不匹配仍会失败，能检出真正坏掉的节点。订阅输出（v2ray URI / Clash.Meta YAML）同步保留 `pinSHA256` 供下游客户端校验。([#2](https://github.com/chao2hang/proxy2sub/issues/2))
+
 ## [0.1.1] - 2026-08-12
 
 ### Fixed
