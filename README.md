@@ -40,11 +40,23 @@ chmod +x proxy2sub-linux-amd64
 ```bash
 git clone https://github.com/chao2hang/proxy2sub.git
 cd proxy2sub
-go build -o proxy2sub .
+go build -tags "with_utls with_quic" -o proxy2sub .
 ./proxy2sub
 ```
 
 默认监听 `:8080`，数据存于同目录 `proxy2sub.db`。可通过环境变量配置（见[配置](#配置环境变量)）。
+
+> ⚠️ **必须带 `-tags "with_utls with_quic"`**：sing-box 的 Reality（依赖 uTLS）与 Hysteria/Hysteria2（依赖 QUIC）支持需要这两个编译标签显式开启，否则这两类节点测活会全部误判 dead（详见 [#1](https://github.com/chao2hang/proxy2sub/issues/1)）。下载 Release 二进制无需关心，已带 tag 构建。
+
+**方式三：Docker**
+
+```bash
+docker run -d --name proxy2sub \
+  -p 8080:8080 -v proxy2sub-data:/data \
+  ghcr.io/chao2hang/proxy2sub:latest
+```
+
+镜像在每次 Release（`v*` tag）时自动构建并推送至 GHCR。
 
 ## 快速开始
 
@@ -146,12 +158,14 @@ curl -L -o Country.mmdb https://github.com/Loyalsoldier/geoip/releases/latest/do
 - 测活通过 sing-box 真实建连完成，支持 ws/grpc/h2/reality 等传输层；ss 插件（obfs-local、v2ray-plugin）按原样透传
 - 文本输入中 `http(s)://` 开头的行按 **HTTP 代理线路** 处理；抓取远程订阅请用 JSON 的 `urls` 字段
 - 只有存活线路才会出现在订阅中，死线路不会下发
+- 构建必须带 `-tags "with_utls with_quic"`：Reality 需要 uTLS、Hysteria/Hysteria2 需要 QUIC，缺 tag 时这两类节点会全部误判 dead
+- `hysteria://`（v1，`?auth=` 格式）与 `hy2://`/`hysteria2://`（v2）均支持；推送响应的 `reason` 字段区分 `dead`（节点本身不可用）与 `unreachable`（环境不可达，如超时、无 IPv6 路由）
 
 ## 开发
 
 ```bash
 go test ./...          # 单元测试（含各协议解析、base64 导入、Clash YAML 合法性）
-go build -o proxy2sub .
+go build -tags "with_utls with_quic" -o proxy2sub .
 ```
 
 `tools/testproxy` 是一个极简本地 CONNECT 代理，便于本地联调测活流程。
