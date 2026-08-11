@@ -195,6 +195,9 @@ func (n *Node) toHysteria2URI() string {
 		q.Set("obfs", n.Obfs)
 		q.Set("obfs-password", n.ObfsPass)
 	}
+	if n.PinSHA256 != "" {
+		q.Set("pinSHA256", n.PinSHA256)
+	}
 	auth := url.PathEscape(n.Password)
 	return fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
 		auth, n.Server, n.Port, q.Encode(), url.QueryEscape(n.Name))
@@ -399,6 +402,9 @@ func writeClashFields(w *yamlWriter, n *Node) {
 		w.kv(ind, "password", yamlQuote(n.Password))
 		if n.SNI != "" {
 			w.kv(ind, "sni", n.SNI)
+		}
+		if n.PinSHA256 != "" {
+			w.kv(ind, "pinSHA256", n.PinSHA256)
 		}
 	case "http":
 		if n.Username != "" {

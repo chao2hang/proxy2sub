@@ -91,6 +91,49 @@ func TestParseHysteria2(t *testing.T) {
 	}
 }
 
+// TestParseHysteria2PinSHA256 是 issue #2 的回归测试：
+// 带 pinSHA256 的自签 Hysteria2 节点必须被正确解析，并在订阅 URI 往返保留。
+func TestParseHysteria2PinSHA256(t *testing.T) {
+	raw := "hysteria2://4e562fc8-abcd-1234-5678-abcdef012345@208.87.242.105:50000/?insecure=false&sni=www.bing.com&pinSHA256=d2fb4f1b833ee7e77e8304dc4652eb13e1b0e064e0874cde3a1a1a1660b74eef&mport=50000-53000#测试"
+	n := mustParse(t, raw)
+	if n.PinSHA256 != "d2fb4f1b833ee7e77e8304dc4652eb13e1b0e064e0874cde3a1a1a1660b74eef" {
+		t.Fatalf("pinSHA256 not parsed: %+v", n)
+	}
+	if n.Insecure {
+		t.Fatalf("insecure should be false when pinSHA256 present: %+v", n)
+	}
+
+	// 订阅 URI 往返：pinSHA256 参数必须保留
+	uri := n.ToURI()
+	n2, err := ParseLink(uri)
+	if err != nil {
+		t.Fatalf("reparse hy2 uri: %v (%s)", err, uri)
+	}
+	if n2.PinSHA256 != n.PinSHA256 {
+		t.Fatalf("pinSHA256 lost in roundtrip: %q vs %q (%s)", n2.PinSHA256, n.PinSHA256, uri)
+	}
+}
+
+// TestDecodePinSHA256 校验指纹格式校验：合法 hex 才通过。
+func TestDecodePinSHA256(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"d2fb4f1b833ee7e77e8304dc4652eb13e1b0e064e0874cde3a1a1a1660b74eef", true},
+		{"", false},
+		{"abc", false},                       // 太短
+		{"zz" + "00", false},                 // 4 字符非 hex
+		{"d2fb4f1b833ee7e77e8304dc4652eb13e1b0e064e0874cde3a1a1a1660b74e", false}, // 63 字符
+	}
+	for _, c := range cases {
+		_, ok := decodePinSHA256(c.in)
+		if ok != c.want {
+			t.Errorf("decodePinSHA256(%q) ok=%v want %v", c.in, ok, c.want)
+		}
+	}
+}
+
 func TestParseAuth(t *testing.T) {
 	n := mustParse(t, "http://user:pw@1.2.3.4:8080#name")
 	if n.Protocol != "http" || n.Username != "user" || n.Password != "pw" {

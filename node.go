@@ -33,6 +33,7 @@ type Node struct {
 	TLS        bool              `json:"tls,omitempty"`
 	Insecure   bool              `json:"insecure,omitempty"`
 	SNI        string            `json:"sni,omitempty"`
+	PinSHA256  string            `json:"pin_sha256,omitempty"` // 证书 SPKI SHA256 指纹（hex），hysteria2 pinSHA256
 	FP         string            `json:"fp,omitempty"` // 指纹
 	ALPN       []string          `json:"alpn,omitempty"`
 	Network    string            `json:"network,omitempty"` // tcp / ws / grpc / h2
@@ -409,6 +410,7 @@ func parseHysteria2(raw string) (*Node, error) {
 	q := u.Query()
 	n.SNI = orDefault(q.Get("sni"), host)
 	n.Insecure = truthy(q.Get("insecure")) || truthy(q.Get("allowInsecure"))
+	n.PinSHA256 = q.Get("pinSHA256")
 	n.ALPN = splitComma(q.Get("alpn"))
 	n.Obfs = q.Get("obfs")
 	n.ObfsPass = q.Get("obfs-password")

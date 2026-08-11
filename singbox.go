@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -245,6 +247,14 @@ func singboxOutbound(n *Node) map[string]any {
 				"enabled": true, "public_key": n.RealityPK, "short_id": n.RealitySID,
 			}
 		}
+		// pinSHA256：Hysteria2 自签证书靠证书指纹固定校验。
+		// sing-box 的 certificate_public_key_sha256 是 Listable[[]byte]，
+		// JSON 反序列化时 []byte 走 base64 std，因此这里 hex→bytes→base64。
+		// 命中后 sing-box 自动 InsecureSkipVerify=true 并改用 pin 校验，
+		// 比直接 insecure:true 更安全（指纹不匹配仍会失败）。
+		if b, ok := decodePinSHA256(n.PinSHA256); ok {
+			tlsObj["certificate_public_key_sha256"] = []string{base64.StdEncoding.EncodeToString(b)}
+		}
 		m["tls"] = tlsObj
 	}
 
@@ -261,6 +271,20 @@ func singboxOutbound(n *Node) map[string]any {
 		m["transport"] = map[string]any{"type": "http", "host": []string{n.Host}, "path": n.Path}
 	}
 	return m
+}
+
+// decodePinSHA256 把 Hysteria2 链接里的 pinSHA256(hex) 解成 32 字节摘要。
+// 合法值是 64 个 hex 字符；非法返回 (nil, false)，调用方静默跳过。
+func decodePinSHA256(s string) ([]byte, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) != 64 {
+		return nil, false
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return nil, false
+	}
+	return b, true
 }
 
 func resolveOne(ctx context.Context, host string) (netip.Addr, error) {
