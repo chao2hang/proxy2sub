@@ -31,6 +31,7 @@ type pushItem struct {
 	node    *Node
 	status  string // pending / alive / dead / added / duplicate / invalid
 	detail  string
+	reason  string // dead / unreachable（仅 status=dead 时有意义）
 	latency int64
 }
 
@@ -68,6 +69,7 @@ type pushResult struct {
 	Status  string `json:"status"`
 	Name    string `json:"name,omitempty"`
 	Detail  string `json:"detail,omitempty"`
+	Reason  string `json:"reason,omitempty"` // dead / unreachable（仅 status=dead 时有值）
 	Latency int64  `json:"latency_ms,omitempty"`
 }
 
@@ -202,13 +204,38 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		resp.Results = make([]pushResult, 0, len(items))
 		for _, it := range items {
 			resp.Results = append(resp.Results, pushResult{
-				Link: it.link, Status: it.status, Name: it.detail, Detail: it.detail, Latency: it.latency,
+				Link: it.link, Status: it.status, Name: it.detail, Detail: it.detail, Reason: it.reason, Latency: it.latency,
 			})
 		}
 	}
 	log.Printf("push: received=%d parsed=%d invalid=%d dup=%d alive=%d dead=%d added=%d",
 		resp.Received, resp.Parsed, resp.Invalid, resp.Duplicates, resp.Alive, resp.Dead, resp.Added)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// classifyTestError 把 sing-box 测活错误归类为面向用户的 reason。
+//
+//	unreachable: 环境不可达（超时 / DNS / 无 IPv6 路由 / 本地网络）
+//	dead:        节点本身问题（协议 / 认证 / TLS / 状态码）
+func classifyTestError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout"),
+		strings.Contains(msg, "deadline exceeded"),
+		strings.Contains(msg, "i/o timeout"),
+		strings.Contains(msg, "no route to host"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "cannot assign requested address"),
+		strings.Contains(msg, "no such host"),
+		strings.Contains(msg, "resolve "),
+		strings.Contains(msg, "no address"):
+		return "unreachable"
+	default:
+		return "dead"
+	}
 }
 
 // testConcurrent 并发测活，结果写入 item.status / item.latency。
@@ -227,6 +254,7 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 			dur, err := s.tester.Test(ctx, it.node)
 			if err != nil {
 				it.status = "dead"
+				it.reason = classifyTestError(err)
 				it.detail = err.Error()
 				return
 			}
@@ -469,9 +497,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		byProtocol[n.Protocol]++
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total":     len(nodes),
-		"country":   byCountry,
-		"protocol":  byProtocol,
+		"total":    len(nodes),
+		"country":  byCountry,
+		"protocol": byProtocol,
 	})
 }
 

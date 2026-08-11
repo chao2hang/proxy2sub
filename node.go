@@ -16,34 +16,36 @@ import (
 // Node 统一描述一条代理线路（支持：vmess / vless / trojan / shadowsocks /
 // hysteria2 / http / socks5）。测活、入库、订阅输出均基于该结构。
 type Node struct {
-	Protocol  string            `json:"protocol"`
-	Server    string            `json:"server"`
-	Port      int               `json:"port"`
-	Name      string            `json:"name,omitempty"`       // 规范名，如 US_1.2.3.4
-	IP        string            `json:"ip,omitempty"`         // Server 解析出的 IP
-	Country   string            `json:"country,omitempty"`    // 国家代码，如 US
-	UUID      string            `json:"uuid,omitempty"`       // vmess / vless
-	AlterID   int               `json:"alter_id,omitempty"`   // vmess
-	Security  string            `json:"security,omitempty"`   // vmess 加密 / ss 加密方法
-	Flow      string            `json:"flow,omitempty"`       // vless
-	Password  string            `json:"password,omitempty"`   // trojan / ss / hysteria2 / http / socks
-	Username  string            `json:"username,omitempty"`   // http / socks
-	Plugin    string            `json:"plugin,omitempty"`     // ss 插件（obfs-local / v2ray-plugin）
-	PluginOpt string            `json:"plugin_opts,omitempty"`
-	TLS       bool              `json:"tls,omitempty"`
-	Insecure  bool              `json:"insecure,omitempty"`
-	SNI       string            `json:"sni,omitempty"`
-	FP        string            `json:"fp,omitempty"` // 指纹
-	ALPN      []string          `json:"alpn,omitempty"`
-	Network   string            `json:"network,omitempty"` // tcp / ws / grpc / h2
-	Host      string            `json:"host,omitempty"`    // ws / h2 的 Host
-	Path      string            `json:"path,omitempty"`
-	Service   string            `json:"service_name,omitempty"` // grpc
-	Header    map[string]string `json:"header,omitempty"`       // ws 自定义头
-	RealityPK string            `json:"reality_pk,omitempty"`   // vless reality
-	RealitySID string           `json:"reality_sid,omitempty"`
-	Obfs      string            `json:"obfs,omitempty"`         // hysteria2 混淆
-	ObfsPass  string            `json:"obfs_password,omitempty"`
+	Protocol   string            `json:"protocol"`
+	Server     string            `json:"server"`
+	Port       int               `json:"port"`
+	Name       string            `json:"name,omitempty"`     // 规范名，如 US_1.2.3.4
+	IP         string            `json:"ip,omitempty"`       // Server 解析出的 IP
+	Country    string            `json:"country,omitempty"`  // 国家代码，如 US
+	UUID       string            `json:"uuid,omitempty"`     // vmess / vless
+	AlterID    int               `json:"alter_id,omitempty"` // vmess
+	Security   string            `json:"security,omitempty"` // vmess 加密 / ss 加密方法
+	Flow       string            `json:"flow,omitempty"`     // vless
+	Password   string            `json:"password,omitempty"` // trojan / ss / hysteria2 / http / socks
+	Username   string            `json:"username,omitempty"` // http / socks
+	Plugin     string            `json:"plugin,omitempty"`   // ss 插件（obfs-local / v2ray-plugin）
+	PluginOpt  string            `json:"plugin_opts,omitempty"`
+	TLS        bool              `json:"tls,omitempty"`
+	Insecure   bool              `json:"insecure,omitempty"`
+	SNI        string            `json:"sni,omitempty"`
+	FP         string            `json:"fp,omitempty"` // 指纹
+	ALPN       []string          `json:"alpn,omitempty"`
+	Network    string            `json:"network,omitempty"` // tcp / ws / grpc / h2
+	Host       string            `json:"host,omitempty"`    // ws / h2 的 Host
+	Path       string            `json:"path,omitempty"`
+	Service    string            `json:"service_name,omitempty"` // grpc
+	Header     map[string]string `json:"header,omitempty"`       // ws 自定义头
+	RealityPK  string            `json:"reality_pk,omitempty"`   // vless reality
+	RealitySID string            `json:"reality_sid,omitempty"`
+	Obfs       string            `json:"obfs,omitempty"` // hysteria2 混淆
+	ObfsPass   string            `json:"obfs_password,omitempty"`
+	UpMbps     int               `json:"up_mbps,omitempty"`   // hysteria v1 上行带宽
+	DownMbps   int               `json:"down_mbps,omitempty"` // hysteria v1 下行带宽
 
 	// 运行时信息
 	LatencyMS int64 `json:"latency_ms,omitempty"`
@@ -79,8 +81,10 @@ func ParseLink(raw string) (*Node, error) {
 		return parseTrojan(raw)
 	case "ss", "shadowsocks":
 		return parseSS(rest, raw)
-	case "hy2", "hysteria", "hysteria2":
+	case "hy2", "hysteria2":
 		return parseHysteria2(raw)
+	case "hysteria":
+		return parseHysteria(raw)
 	case "http", "https":
 		return parseHTTP(raw)
 	case "socks", "socks5", "socks4":
@@ -412,6 +416,47 @@ func parseHysteria2(raw string) (*Node, error) {
 	return n, nil
 }
 
+// parseHysteria 解析 hysteria v1 链接：hysteria://host:port/?auth=xxx&peer=xxx
+// v1 与 v2 协议不同：v1 用 auth 串、obfs=xplus（密码放 obfsParam）、需 up/down 带宽。
+func parseHysteria(raw string) (*Node, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, ErrUnsupported
+	}
+	host, port, err := splitHostPort(u.Host)
+	if err != nil {
+		return nil, ErrUnsupported
+	}
+	n := &Node{Protocol: "hysteria", Server: host, Port: port}
+	q := u.Query()
+	// auth: 标准放 query param，少数客户端放 userinfo
+	if a := q.Get("auth"); a != "" {
+		n.Password = a
+	} else if u.User != nil {
+		n.Password = u.User.Username()
+	}
+	n.SNI = orDefault(q.Get("sni"), q.Get("peer"))
+	if n.SNI == "" {
+		n.SNI = host
+	}
+	n.Insecure = truthy(q.Get("insecure")) || truthy(q.Get("allowInsecure"))
+	n.ALPN = splitComma(q.Get("alpn"))
+	// obfsParam 是 xplus 密码；部分链接把密码直接放 obfs（而非 "xplus" 类型）
+	if op := q.Get("obfsParam"); op != "" {
+		n.Obfs = op
+	} else if o := q.Get("obfs"); o != "" && o != "xplus" {
+		n.Obfs = o
+	}
+	if up, err := strconv.Atoi(q.Get("upmbps")); err == nil && up > 0 {
+		n.UpMbps = up
+	}
+	if down, err := strconv.Atoi(q.Get("downmbps")); err == nil && down > 0 {
+		n.DownMbps = down
+	}
+	n.TLS = true
+	return n, nil
+}
+
 // ---------------------------------------------------------------------------
 // http / socks5
 // ---------------------------------------------------------------------------
@@ -527,7 +572,7 @@ func (n *Node) Verify() error {
 		if n.UUID == "" {
 			return fmt.Errorf("%s: missing uuid", n.Protocol)
 		}
-	case "trojan", "hysteria2":
+	case "trojan", "hysteria", "hysteria2":
 		if n.Password == "" {
 			return fmt.Errorf("%s: missing password", n.Protocol)
 		}

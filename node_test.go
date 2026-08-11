@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -190,6 +191,76 @@ func TestClashYAMLMultiProtocol(t *testing.T) {
 		m := p.(map[string]any)
 		if _, ok := m["name"].(string); !ok {
 			t.Fatalf("proxy %d missing name: %v", i, m)
+		}
+	}
+}
+
+func TestParseHysteriaV1(t *testing.T) {
+	raw := "hysteria://auth-str@1.2.3.4:443?peer=hy.example.com&insecure=1&obfsParam=xplus-pw&upmbps=50&downmbps=100&alpn=h2#name"
+	n := mustParse(t, raw)
+	if n.Protocol != "hysteria" || n.Password != "auth-str" || n.SNI != "hy.example.com" {
+		t.Fatalf("bad hysteria v1: %+v", n)
+	}
+	if !n.Insecure || n.Obfs != "xplus-pw" || n.UpMbps != 50 || n.DownMbps != 100 {
+		t.Fatalf("bad hysteria v1 fields: %+v", n)
+	}
+	if !n.TLS {
+		t.Fatalf("hysteria v1 must have TLS")
+	}
+}
+
+func TestParseHysteriaV1QueryAuth(t *testing.T) {
+	// auth 在 query param 而非 userinfo（hysteria v1 标准格式）
+	n := mustParse(t, "hysteria://1.2.3.4:443?auth=query-auth&peer=hy.example.com#n")
+	if n.Password != "query-auth" {
+		t.Fatalf("bad hysteria v1 query auth: %+v", n)
+	}
+}
+
+func TestHysteriaV1Roundtrip(t *testing.T) {
+	raw := "hysteria://auth@1.2.3.4:443?peer=hy.example.com&insecure=1&upmbps=50&downmbps=100#name"
+	n := mustParse(t, raw)
+	uri := n.ToURI()
+	if uri == "" {
+		t.Fatalf("empty ToURI for hysteria v1")
+	}
+	n2, err := ParseLink(uri)
+	if err != nil {
+		t.Fatalf("reparse hysteria v1: %v (%s)", err, uri)
+	}
+	if n2.Key() != n.Key() {
+		t.Fatalf("roundtrip key mismatch: %q vs %q", n2.Key(), n.Key())
+	}
+	if n2.Password != n.Password || n2.UpMbps != n.UpMbps || n2.DownMbps != n.DownMbps {
+		t.Fatalf("roundtrip field loss: %+v vs %+v", n2, n)
+	}
+}
+
+func TestHysteriaV1NotTreatedAsV2(t *testing.T) {
+	// 老 hysteria:// 链接不应被当 hysteria2 处理（issue #1 补充点）
+	n := mustParse(t, "hysteria://auth@1.2.3.4:443?peer=hy.example.com#n")
+	if n.Protocol != "hysteria" {
+		t.Fatalf("hysteria:// must parse as v1, got protocol=%s", n.Protocol)
+	}
+}
+
+func TestClassifyTestError(t *testing.T) {
+	cases := []struct {
+		err  string
+		want string
+	}{
+		{"dial tcp 1.2.3.4:443: i/o timeout", "unreachable"},
+		{"resolve example.com: no such host", "unreachable"},
+		{"dial: network is unreachable", "unreachable"},
+		{"context deadline exceeded", "unreachable"},
+		{"dial [2606:4700::1]:443: no route to host", "unreachable"},
+		{"tls handshake: certificate signed by unknown authority", "dead"},
+		{"status 502", "dead"},
+		{"init singbox: uTLS is not included", "dead"},
+	}
+	for _, c := range cases {
+		if got := classifyTestError(fmt.Errorf("%s", c.err)); got != c.want {
+			t.Errorf("classifyTestError(%q) = %q, want %q", c.err, got, c.want)
 		}
 	}
 }

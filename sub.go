@@ -25,6 +25,8 @@ func (n *Node) ToURI() string {
 		return n.toTrojanURI()
 	case "shadowsocks":
 		return n.toSSURI()
+	case "hysteria":
+		return n.toHysteriaURI()
 	case "hysteria2":
 		return n.toHysteria2URI()
 	case "http":
@@ -150,6 +152,32 @@ func (n *Node) toSSURI() string {
 		uri += "?plugin=" + url.QueryEscape(n.Plugin+opts)
 	}
 	return uri + "#" + url.QueryEscape(n.Name)
+}
+
+func (n *Node) toHysteriaURI() string {
+	q := url.Values{}
+	if n.SNI != "" {
+		q.Set("peer", n.SNI)
+	}
+	if n.Insecure {
+		q.Set("insecure", "1")
+	}
+	if len(n.ALPN) > 0 {
+		q.Set("alpn", strings.Join(n.ALPN, ","))
+	}
+	if n.Obfs != "" {
+		q.Set("obfs", "xplus")
+		q.Set("obfsParam", n.Obfs)
+	}
+	if n.UpMbps > 0 {
+		q.Set("upmbps", strconv.Itoa(n.UpMbps))
+	}
+	if n.DownMbps > 0 {
+		q.Set("downmbps", strconv.Itoa(n.DownMbps))
+	}
+	auth := url.PathEscape(n.Password)
+	return fmt.Sprintf("hysteria://%s@%s:%d?%s#%s",
+		auth, n.Server, n.Port, q.Encode(), url.QueryEscape(n.Name))
 }
 
 func (n *Node) toHysteria2URI() string {
@@ -343,6 +371,29 @@ func writeClashFields(w *yamlWriter, n *Node) {
 		if n.Plugin != "" {
 			w.kv(ind, "plugin", n.Plugin)
 			w.kv(ind, "plugin-opts", yamlQuote(n.PluginOpt))
+		}
+	case "hysteria":
+		w.kv(ind, "auth-str", yamlQuote(n.Password))
+		if n.Obfs != "" {
+			w.kv(ind, "obfs", "xplus")
+			w.kv(ind, "obfs-password", yamlQuote(n.Obfs))
+		}
+		up := n.UpMbps
+		if up == 0 {
+			up = 100
+		}
+		down := n.DownMbps
+		if down == 0 {
+			down = 100
+		}
+		w.kv(ind, "up", fmt.Sprintf("%d Mbps", up))
+		w.kv(ind, "down", fmt.Sprintf("%d Mbps", down))
+		if n.SNI != "" {
+			w.kv(ind, "sni", n.SNI)
+		}
+		w.kvB(ind, "skip-cert-verify", n.Insecure)
+		if len(n.ALPN) > 0 {
+			w.kv(ind, "alpn", strings.Join(n.ALPN, ","))
 		}
 	case "hysteria2":
 		w.kv(ind, "password", yamlQuote(n.Password))
