@@ -2,6 +2,12 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.3] - 2026-08-15
+
+### Added
+
+- **支持 `anytls://` 协议节点**：此前 `ParseLink` 未实现 anytls 分支，推送含 anytls 节点的订阅时整批落入 `invalid`（机场订阅中 anytls 占比日益升高）。新增 `parseAnyTLS` 解析 `password`/`sni`/`alpn`/`fp`/`insecure`，sing-box 测活走原生 `anytls` outbound（强制 TLS），订阅输出（v2ray URI / Clash.Meta YAML）完整往返。([#3](https://github.com/chao2hang/proxy2sub/issues/3))
+
 ## [0.1.2] - 2026-08-12
 
 ### Fixed
