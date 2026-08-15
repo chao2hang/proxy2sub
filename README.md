@@ -4,7 +4,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go) ![Release](https://img.shields.io/github/v/release/chao2hang/proxy2sub)
 
-接收各渠道推送的代理线路（vmess / vless / trojan / shadowsocks / hysteria2 / http / socks5），**入库前真实测活，活的才放行**；**周期性复测，失效的自动删除**；对外提供按国家分组的订阅链接（Clash YAML / v2ray base64），节点名为 `国家代码_IP`（如 `US_1.2.3.4`）。
+接收各渠道推送的代理线路（vmess / vless / trojan / shadowsocks / hysteria2 / anytls / http / socks5），**入库前真实测活，活的才放行**；**周期性复测，失效的自动删除**；对外提供按国家分组的订阅链接（Clash YAML / v2ray base64），节点名为 `国家代码_IP`（如 `US_1.2.3.4`）。
 
 ## 特性
 
@@ -160,6 +160,7 @@ curl -L -o Country.mmdb https://github.com/Loyalsoldier/geoip/releases/latest/do
 - 只有存活线路才会出现在订阅中，死线路不会下发
 - 构建必须带 `-tags "with_utls with_quic"`：Reality 需要 uTLS、Hysteria/Hysteria2 需要 QUIC，缺 tag 时这两类节点会全部误判 dead
 - `hysteria://`（v1，`?auth=` 格式）与 `hy2://`/`hysteria2://`（v2）均支持；推送响应的 `reason` 字段区分 `dead`（节点本身不可用）与 `unreachable`（环境不可达，如超时、无 IPv6 路由）
+- 支持 `anytls://` 协议（Clash/mihomo 订阅中常见），解析后经 sing-box 原生 anytls outbound 测活，订阅输出（v2ray URI / Clash YAML）完整往返
 
 ## 开发
 

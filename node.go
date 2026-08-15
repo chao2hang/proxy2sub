@@ -14,7 +14,7 @@ import (
 )
 
 // Node 统一描述一条代理线路（支持：vmess / vless / trojan / shadowsocks /
-// hysteria2 / http / socks5）。测活、入库、订阅输出均基于该结构。
+// hysteria2 / anytls / http / socks5）。测活、入库、订阅输出均基于该结构。
 type Node struct {
 	Protocol   string            `json:"protocol"`
 	Server     string            `json:"server"`
@@ -84,6 +84,8 @@ func ParseLink(raw string) (*Node, error) {
 		return parseSS(rest, raw)
 	case "hy2", "hysteria2":
 		return parseHysteria2(raw)
+	case "anytls":
+		return parseAnyTLS(raw)
 	case "hysteria":
 		return parseHysteria(raw)
 	case "http", "https":
@@ -418,6 +420,30 @@ func parseHysteria2(raw string) (*Node, error) {
 	return n, nil
 }
 
+// parseAnyTLS 解析 anytls 链接：anytls://password@host:port?sni=...&alpn=...&fp=...&insecure=...
+// anytls 是 TCP+TLS 协议，无传输层与 obfs；与 hysteria2 不同的是认证用 password 而非 auth 串。
+func parseAnyTLS(raw string) (*Node, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, ErrUnsupported
+	}
+	host, port, err := splitHostPort(u.Host)
+	if err != nil {
+		return nil, ErrUnsupported
+	}
+	n := &Node{Protocol: "anytls", Server: host, Port: port}
+	if u.User != nil {
+		n.Password = u.User.Username()
+	}
+	q := u.Query()
+	n.SNI = orDefault(q.Get("sni"), host)
+	n.Insecure = truthy(q.Get("insecure")) || truthy(q.Get("allowInsecure"))
+	n.ALPN = splitComma(q.Get("alpn"))
+	n.FP = q.Get("fp")
+	n.TLS = true // anytls 必须开启 TLS（sing-box outbound 强制校验）
+	return n, nil
+}
+
 // parseHysteria 解析 hysteria v1 链接：hysteria://host:port/?auth=xxx&peer=xxx
 // v1 与 v2 协议不同：v1 用 auth 串、obfs=xplus（密码放 obfsParam）、需 up/down 带宽。
 func parseHysteria(raw string) (*Node, error) {
@@ -574,7 +600,7 @@ func (n *Node) Verify() error {
 		if n.UUID == "" {
 			return fmt.Errorf("%s: missing uuid", n.Protocol)
 		}
-	case "trojan", "hysteria", "hysteria2":
+	case "trojan", "hysteria", "hysteria2", "anytls":
 		if n.Password == "" {
 			return fmt.Errorf("%s: missing password", n.Protocol)
 		}

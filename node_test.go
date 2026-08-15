@@ -91,6 +91,53 @@ func TestParseHysteria2(t *testing.T) {
 	}
 }
 
+// TestParseAnyTLS 是 issue #3 的回归测试：
+// anytls:// 节点（Clash/mihomo 订阅常见）必须被解析，而不是落入 invalid。
+func TestParseAnyTLS(t *testing.T) {
+	raw := "anytls://pass-word@1.2.3.4:443?sni=www.bing.com&alpn=h2%2Chttp%2F1.1&fp=chrome&insecure=1#测试"
+	n := mustParse(t, raw)
+	if n.Protocol != "anytls" || n.Password != "pass-word" || n.Server != "1.2.3.4" || n.Port != 443 {
+		t.Fatalf("bad anytls: %+v", n)
+	}
+	if n.SNI != "www.bing.com" {
+		t.Fatalf("bad anytls sni: %q", n.SNI)
+	}
+	if !n.TLS {
+		t.Fatalf("anytls must require TLS")
+	}
+	if !n.Insecure {
+		t.Fatalf("bad anytls insecure: %+v", n)
+	}
+	if len(n.ALPN) != 2 || n.ALPN[0] != "h2" || n.ALPN[1] != "http/1.1" {
+		t.Fatalf("bad anytls alpn: %+v", n.ALPN)
+	}
+	if n.FP != "chrome" {
+		t.Fatalf("bad anytls fp: %q", n.FP)
+	}
+
+	// 订阅 URI 往返
+	uri := n.ToURI()
+	n2, err := ParseLink(uri)
+	if err != nil {
+		t.Fatalf("reparse anytls uri: %v (%s)", err, uri)
+	}
+	if n2.Password != n.Password || n2.SNI != n.SNI || n2.FP != n.FP {
+		t.Fatalf("anytls roundtrip field loss: %+v vs %+v (%s)", n2, n, uri)
+	}
+	if n2.Key() != n.Key() {
+		t.Fatalf("roundtrip key mismatch: %q vs %q", n2.Key(), n.Key())
+	}
+}
+
+func TestParseAnyTLSMissingPassword(t *testing.T) {
+	// 无 userinfo 的 anytls 应解析失败（Verify 报 missing password）
+	if n, err := ParseLink("anytls://1.2.3.4:443?sni=x#n"); err == nil {
+		if verr := n.Verify(); verr == nil {
+			t.Fatalf("expected missing password error, got %+v", n)
+		}
+	}
+}
+
 // TestParseHysteria2PinSHA256 是 issue #2 的回归测试：
 // 带 pinSHA256 的自签 Hysteria2 节点必须被正确解析，并在订阅 URI 往返保留。
 func TestParseHysteria2PinSHA256(t *testing.T) {
@@ -160,6 +207,7 @@ func TestToURIRoundtrip(t *testing.T) {
 		"trojan://pass@1.2.3.4:443?sni=cdn.com#name",
 		"ss://YWVzLTI1Ni1nY206c2VjcmV0@1.2.3.4:8388#name",
 		"hysteria2://auth@1.2.3.4:443?insecure=1#name",
+		"anytls://pass@1.2.3.4:443?sni=cdn.com&alpn=h2&fp=chrome&insecure=1#name",
 		"http://u:p@1.2.3.4:8080#name",
 		"socks5://u:p@1.2.3.4:1080#name",
 	}
@@ -210,6 +258,7 @@ func TestClashYAMLMultiProtocol(t *testing.T) {
 		"trojan://pass@1.2.3.4:443?sni=cdn.com#name",
 		"ss://YWVzLTI1Ni1nY206c2VjcmV0@1.2.3.4:8388#name",
 		"hysteria2://auth@1.2.3.4:443?insecure=1#name",
+		"anytls://pass@1.2.3.4:443?sni=cdn.com&alpn=h2&fp=chrome&insecure=1#name",
 		"http://u:p@1.2.3.4:8080#name",
 		"socks5://u:p@1.2.3.4:1080#name",
 	}

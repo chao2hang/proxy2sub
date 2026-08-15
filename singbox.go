@@ -197,6 +197,9 @@ func singboxOutbound(n *Node) map[string]any {
 		if n.Obfs != "" {
 			m["obfs"] = map[string]any{"type": n.Obfs, "password": n.ObfsPass}
 		}
+	case "anytls":
+		// anytls：TCP+TLS，认证用 password；无 obfs/传输层。
+		m["password"] = n.Password
 	case "hysteria":
 		// hysteria v1: auth_str 是认证串，obfs 是 xplus 密码。
 		// up/down 缺省给 100 Mbps（测活数据量小，0 可能导致 BBR 协商异常）。
@@ -228,7 +231,8 @@ func singboxOutbound(n *Node) map[string]any {
 
 	if n.TLS && (n.Protocol == "vmess" || n.Protocol == "vless" ||
 		n.Protocol == "trojan" || n.Protocol == "hysteria" ||
-		n.Protocol == "hysteria2" || n.Protocol == "http") {
+		n.Protocol == "hysteria2" || n.Protocol == "anytls" ||
+		n.Protocol == "http") {
 		tlsObj := map[string]any{
 			"enabled":     true,
 			"server_name": orDefault(n.SNI, n.Server),

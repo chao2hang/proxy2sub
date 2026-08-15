@@ -29,6 +29,8 @@ func (n *Node) ToURI() string {
 		return n.toHysteriaURI()
 	case "hysteria2":
 		return n.toHysteria2URI()
+	case "anytls":
+		return n.toAnyTLSURI()
 	case "http":
 		return n.toAuthURI("http")
 	case "socks":
@@ -200,6 +202,25 @@ func (n *Node) toHysteria2URI() string {
 	}
 	auth := url.PathEscape(n.Password)
 	return fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
+		auth, n.Server, n.Port, q.Encode(), url.QueryEscape(n.Name))
+}
+
+func (n *Node) toAnyTLSURI() string {
+	q := url.Values{}
+	if n.SNI != "" {
+		q.Set("sni", n.SNI)
+	}
+	if n.Insecure {
+		q.Set("insecure", "1")
+	}
+	if len(n.ALPN) > 0 {
+		q.Set("alpn", strings.Join(n.ALPN, ","))
+	}
+	if n.FP != "" {
+		q.Set("fp", n.FP)
+	}
+	auth := url.PathEscape(n.Password)
+	return fmt.Sprintf("anytls://%s@%s:%d?%s#%s",
 		auth, n.Server, n.Port, q.Encode(), url.QueryEscape(n.Name))
 }
 
@@ -406,6 +427,19 @@ func writeClashFields(w *yamlWriter, n *Node) {
 		if n.PinSHA256 != "" {
 			w.kv(ind, "pinSHA256", n.PinSHA256)
 		}
+	case "anytls":
+		// mihomo anytls：password + TLS 字段（sni/alpn/client-fingerprint/skip-cert-verify）
+		w.kv(ind, "password", yamlQuote(n.Password))
+		if n.SNI != "" {
+			w.kv(ind, "sni", n.SNI)
+		}
+		if len(n.ALPN) > 0 {
+			w.kv(ind, "alpn", strings.Join(n.ALPN, ","))
+		}
+		if n.FP != "" && n.FP != "none" {
+			w.kv(ind, "client-fingerprint", n.FP)
+		}
+		w.kvB(ind, "skip-cert-verify", n.Insecure)
 	case "http":
 		if n.Username != "" {
 			w.kv(ind, "username", n.Username)
