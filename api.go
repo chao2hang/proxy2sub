@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,8 +23,15 @@ type Server struct {
 	cfg        *Config
 	store      *Store
 	geo        GeoResolver
-	tester     *Tester
+	tester     TesterIface
 	httpClient *http.Client
+
+	checkRunning atomic.Bool // 周期测活单飞（见 #5）
+}
+
+// TesterIface 测活器接口；*Tester 隐式满足，测试可注入 fake。
+type TesterIface interface {
+	Test(ctx context.Context, n *Node) (time.Duration, error)
 }
 
 // pushItem 一次推送中单条线路的状态。
@@ -240,17 +248,33 @@ func classifyTestError(err error) string {
 }
 
 // testConcurrent 并发测活，结果写入 item.status / item.latency。
+// 全局 deadline 兜底：sing-box 内部 syscall 泄漏（QUIC/UTLS/DNS 等）时不会无限等
+// 泄漏 goroutine，而是按当前结果返回（见 #5）。
 func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 	if len(items) == 0 {
 		return
 	}
 	sem := make(chan struct{}, s.cfg.Concurrency)
+	// 全局 deadline：TestTimeout*3 + 30s，与 handlePush 的总超时保持一致
+	testCtx, cancel := context.WithTimeout(ctx, s.cfg.TestTimeout*3+30*time.Second)
+	defer cancel()
+
+	var done int32
 	var wg sync.WaitGroup
+	wg.Add(len(items))
 	for _, it := range items {
-		wg.Add(1)
-		sem <- struct{}{}
 		go func(it *pushItem) {
 			defer wg.Done()
+			// 非阻塞抢信号量：抢不到则本轮跳过（pending 节点留待下轮再测）
+			select {
+			case sem <- struct{}{}:
+			default:
+				it.status = "dead"
+				it.reason = "unreachable"
+				it.detail = "skipped: concurrency full"
+				atomic.AddInt32(&done, 1)
+				return
+			}
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
@@ -261,8 +285,12 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 					it.detail = fmt.Sprintf("tester panic: %v", r)
 					log.Printf("tester panic on %s: %v\n%s", it.node.Name, r, debug.Stack())
 				}
+				atomic.AddInt32(&done, 1)
 			}()
-			dur, err := s.tester.Test(ctx, it.node)
+			// 单节点硬截止：1.5x TestTimeout，留余量给 sing-box 内部清理
+			perCtx, perCancel := context.WithTimeout(testCtx, time.Duration(float64(s.cfg.TestTimeout)*1.5))
+			dur, err := s.tester.Test(perCtx, it.node)
+			perCancel()
 			if err != nil {
 				it.status = "dead"
 				it.reason = classifyTestError(err)
@@ -273,7 +301,23 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 			it.latency = dur.Milliseconds()
 		}(it)
 	}
-	wg.Wait()
+	// 轮询等所有节点完成或全局 deadline（不再 wg.Wait 无限等）
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	expected := int32(len(items))
+	for atomic.LoadInt32(&done) < expected {
+		select {
+		case <-testCtx.Done():
+			log.Printf("periodic check: global deadline hit, %d/%d items unresolved (leaked goroutines left running)",
+				atomic.LoadInt32(&done), expected)
+			return
+		case <-poll.C:
+		}
+	}
+	// 最佳努力清点泄漏 goroutine（不阻塞当前 checkOnce 返回；泄漏 goroutine 终会被 GC）
+	go func() {
+		wg.Wait()
+	}()
 }
 
 // checkOnce 周期测活：失效删除，存活更新结果。
@@ -284,7 +328,8 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 		log.Printf("periodic check: load: %v", err)
 		return 0, 0, 0
 	}
-	log.Printf("periodic check: start total=%d", len(nodes))
+	log.Printf("periodic check: start total=%d concurrency=%d timeout=%s",
+		len(nodes), s.cfg.Concurrency, s.cfg.TestTimeout)
 	if len(nodes) == 0 {
 		return 0, 0, 0
 	}
@@ -335,8 +380,15 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 	return total, alive, deadCount
 }
 
-// safeCheckOnce 包 recover 的 checkOnce，确保单次 panic 不杀死周期 goroutine（见 #4）。
+// safeCheckOnce 包 recover + running 互斥的 checkOnce。
+// - recover：单次 panic 不杀死周期 goroutine（见 #4）
+// - 单飞：上一轮未结束时不启动新一轮，避免泄漏 goroutine 叠加（见 #5）
 func (s *Server) safeCheckOnce(ctx context.Context) (total, alive, dead int) {
+	if !s.checkRunning.CompareAndSwap(false, true) {
+		log.Printf("periodic check: skip, previous round still running")
+		return 0, 0, 0
+	}
+	defer s.checkRunning.Store(false)
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("periodic check: panic recovered: %v\n%s", r, debug.Stack())

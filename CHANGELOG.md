@@ -2,6 +2,20 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.5] - 2026-08-19
+
+### Fixed
+
+- **v0.1.4 `checkOnce` 死锁 / 多轮叠加**：`testConcurrent` 同步 `wg.Wait()` 等待所有测活完成，但 sing-box 内部 syscall 泄漏（QUIC/UTLS/DNS 底层 socket）不响应 ctx 取消，单节点测活永久阻塞 → 后续节点在 `sem <- struct{}{}` 处永久卡住 → `wg.Wait()` 永不返回 → `checkOnce` 卡死，每 10min ticker 叠加新一轮最终 OOM。([#5](https://github.com/chao2hang/proxy2sub/issues/5))
+
+  现重写并发模型：
+  - `sem <- struct{}{}` 移入 goroutine 内 + `select default` 跳过（信号量满的节点本轮直接标 `dead/skipped: concurrency full` 留待下轮再测），主循环不再阻塞
+  - 全局 `testCtx = TestTimeout*3 + 30s` 兜底，轮询 `done` 计数；deadline 一到立即 return，不再等泄漏 goroutine
+  - 最佳努力 `go wg.Wait()` 在后台清点泄漏（不阻塞 checkOnce 返回）
+  - `safeCheckOnce` 加 `atomic.Bool.CompareAndSwap` 单飞：上一轮未结束则本轮 `skip, previous round still running` 立即返回，避免多轮叠加
+  - `checkOnce` 起始日志补 `concurrency=%d timeout=%s`，便于排障
+  - `Server.tester` 改接口 (`TesterIface`)，便于测试注入 fake tester 覆盖泄漏场景
+
 ## [0.1.4] - 2026-08-18
 
 ### Fixed

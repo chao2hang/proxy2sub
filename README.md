@@ -143,7 +143,7 @@ v2rayN / Clash 客户端的订阅地址均填写：`http://<host>:<port>/sub`
 | `PROXY2SUB_CHECK_ON_START` | `false` | 启动 3 秒后先跑一轮测活；周期任务自带 panic recover，畸形节点不会杀死 ticker goroutine |
 | `PROXY2SUB_TEST_TIMEOUT` | `8s` | 单节点测活超时 |
 | `PROXY2SUB_TEST_URL` | `http://www.gstatic.com/generate_204` | 测活目标（经代理访问） |
-| `PROXY2SUB_CONCURRENCY` | `20` | 测活并发数 |
+| `PROXY2SUB_CONCURRENCY` | `20` | 测活并发数；>节点数 时多余的会被本轮跳过（`dead/skipped: concurrency full`），留待下轮再测 |
 | `PROXY2SUB_GEOIP_DB` | 空 | 本地 mmdb 文件路径（缺省读取同目录 `Country.mmdb`，都没有则用 ip-api.com 在线接口） |
 
 ## 国家识别
