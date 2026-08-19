@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -251,6 +252,16 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 		go func(it *pushItem) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					// 单节点测活 panic：标记为 dead（保守归 unreachable），
+					// 不传染其他节点、不杀整个 checkOnce（见 #4）。
+					it.status = "dead"
+					it.reason = "unreachable"
+					it.detail = fmt.Sprintf("tester panic: %v", r)
+					log.Printf("tester panic on %s: %v\n%s", it.node.Name, r, debug.Stack())
+				}
+			}()
 			dur, err := s.tester.Test(ctx, it.node)
 			if err != nil {
 				it.status = "dead"
@@ -266,14 +277,16 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 }
 
 // checkOnce 周期测活：失效删除，存活更新结果。
-func (s *Server) checkOnce(ctx context.Context) {
+// 返回 total/alive/dead 计数（供 /api/check 同步模式使用）。
+func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 	nodes, err := s.store.All()
 	if err != nil {
 		log.Printf("periodic check: load: %v", err)
-		return
+		return 0, 0, 0
 	}
+	log.Printf("periodic check: start total=%d", len(nodes))
 	if len(nodes) == 0 {
-		return
+		return 0, 0, 0
 	}
 	items := make([]*pushItem, 0, len(nodes))
 	for _, n := range nodes {
@@ -292,7 +305,6 @@ func (s *Server) checkOnce(ctx context.Context) {
 	ccMap := s.geo.Resolve(addrs)
 	now := time.Now().Unix()
 	var dead []int64
-	alive := 0
 	for _, it := range items {
 		n := it.node
 		if it.status != "alive" {
@@ -317,10 +329,30 @@ func (s *Server) checkOnce(ctx context.Context) {
 			log.Printf("periodic check: delete %d: %v", id, derr)
 		}
 	}
-	log.Printf("periodic check: total=%d alive=%d dead=%d", len(nodes), alive, len(dead))
+	deadCount = len(dead)
+	total = len(nodes)
+	log.Printf("periodic check: total=%d alive=%d dead=%d", total, alive, deadCount)
+	return total, alive, deadCount
 }
 
-func (s *Server) checkLoop(ctx context.Context, interval time.Duration) {
+// safeCheckOnce 包 recover 的 checkOnce，确保单次 panic 不杀死周期 goroutine（见 #4）。
+func (s *Server) safeCheckOnce(ctx context.Context) (total, alive, dead int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("periodic check: panic recovered: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return s.checkOnce(ctx)
+}
+
+// checkLoop 按 CheckInterval 周期触发 safeCheckOnce。
+// 若 runOnStart 为 true，启动后先 sleep 3s 跑一轮（让 store/geo/tester 就绪），
+// 随后进入 ticker 循环。
+func (s *Server) checkLoop(ctx context.Context, interval time.Duration, runOnStart bool) {
+	if runOnStart {
+		time.Sleep(3 * time.Second)
+		s.safeCheckOnce(ctx)
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -328,7 +360,7 @@ func (s *Server) checkLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.checkOnce(ctx)
+			s.safeCheckOnce(ctx)
 		}
 	}
 }
@@ -506,4 +538,34 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	n, _ := s.store.Count()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": n})
+}
+
+// handleCheck 手动触发一轮周期测活（见 #4）。
+//
+//	POST /api/check                → 同步执行，返回结果
+//	POST /api/check?sync=0         → 异步执行，立即 202
+//
+// 鉴权复用 PushToken（管理员操作）。
+func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.requireToken(s.cfg.PushToken, r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if r.URL.Query().Get("sync") == "0" {
+		go s.safeCheckOnce(context.Background())
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+		return
+	}
+	// 同步：复用 safeCheckOnce（自带 recover），单节点测活 panic 也不影响整体返回。
+	total, alive, dead := s.safeCheckOnce(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"total":  total,
+		"alive":  alive,
+		"dead":   dead,
+	})
 }

@@ -40,18 +40,13 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if cfg.CheckOnStart {
-		go func() {
-			time.Sleep(3 * time.Second)
-			srv.checkOnce(ctx)
-		}()
-	}
-	go srv.checkLoop(ctx, cfg.CheckInterval)
+	go srv.checkLoop(ctx, cfg.CheckInterval, cfg.CheckOnStart)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/push", srv.handlePush)
-	mux.HandleFunc("/sub", srv.handleSub)
+	mux.HandleFunc("/api/check", srv.handleCheck)
 	mux.HandleFunc("/api/stats", srv.handleStats)
+	mux.HandleFunc("/sub", srv.handleSub)
 	mux.HandleFunc("/healthz", srv.handleHealth)
 
 	server := &http.Server{
@@ -59,8 +54,8 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("proxy2sub listening on %s (check interval=%s, test timeout=%s, concurrency=%d)",
-		cfg.Addr, cfg.CheckInterval, cfg.TestTimeout, cfg.Concurrency)
+	log.Printf("proxy2sub listening on %s (check interval=%s, check_on_start=%v, test timeout=%s, concurrency=%d)",
+		cfg.Addr, cfg.CheckInterval, cfg.CheckOnStart, cfg.TestTimeout, cfg.Concurrency)
 	log.Printf("test url: %s", cfg.TestURL)
 	if cfg.PushToken != "" {
 		log.Printf("push token: enabled")

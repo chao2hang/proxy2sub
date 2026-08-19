@@ -2,6 +2,17 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.4] - 2026-08-18
+
+### Fixed
+
+- **官方镜像 `checkLoop` 周期检查从未执行**：`testConcurrent` / `checkOnce` / `checkLoop` 全程无 panic recover，遇到畸形节点（如 sing-box 配置异常、参数组合越界）时单节点测活 panic 会直接杀死整个周期 goroutine，main 无感知，导致 `last_check` 仅随 push 更新、失效节点永不清理。现已为每节点 goroutine、`checkOnce`、`checkLoop` 三层加 `defer recover()`，单节点 panic 仅记日志并标记 dead，不影响其他节点也不影响后续周期；同步 `safeCheckOnce` 复用于 `POST /api/check`。`checkOnce` 同时增加起始行 `start total=N` 日志，让"ticker 在转"对空库也可见。([#4](https://github.com/chao2hang/proxy2sub/issues/4))
+- **`PROXY2SUB_CHECK_ON_START` 真正生效**：原实现是独立 goroutine `time.Sleep(3s)` 后调 `checkOnce`，无 recover 且与 ticker 解耦。现已并入 `checkLoop`，首轮与 ticker 同栈走 `safeCheckOnce`，确保即便首轮 panic 也不影响后续周期。([#4](https://github.com/chao2hang/proxy2sub/issues/4))
+
+### Added
+
+- **`POST /api/check` 手动触发测活**：同步模式返回 `{status, total, alive, dead}`；`?sync=0` 异步模式立即返回 202。复用 `PROXY2SUB_PUSH_TOKEN` 鉴权。便于排障时无需等待周期。([#4](https://github.com/chao2hang/proxy2sub/issues/4))
+
 ## [0.1.3] - 2026-08-15
 
 ### Added
