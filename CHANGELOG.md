@@ -2,6 +2,21 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.6] - 2026-08-19
+
+### Fixed
+
+- **周期检查误删全部节点（v0.1.5 #6 复盘 2555→17）**：`testConcurrent` 的 `sem-full` 跳过分支曾把"本轮未测到"的节点直接打上 `dead` 标签，`checkOnce` 的删除条件又是"非 alive 即删"，导致并发数小于节点数时首轮把 keep-alive 之外的 TCP 类节点（vless/trojan/anytls/hy2）批量误判死节点并删除；全局 deadline 兜底触发时残留的未完成项同样落在"非 alive 即删"路径下被误删。([#6](https://github.com/chao2hang/proxy2sub/issues/6))
+
+  现修复三处歧义：
+  - `api.go` `testConcurrent` 的 `sem-full` 默认分支：放弃 dead 标，改用 `status = "skipped"` —— 仅表示"本轮因 sem 满未测到"，留待下轮再测
+  - `api.go` `checkOnce` 删除条件：由 `if it.status != "alive"` 改为 `if it.status == "dead"` —— 只有确认 sing-box 报错或 panics 的节点才进删除队列，`pending` / `skipped` / `""` 全部保留，下一轮重测
+  - `api.go` `checkOnce` 新增删除熔断 `PROXY2SUB_MAX_DEAD_RATIO`（默认 `50`）：单轮 `dead/total` 比例超阈值时立即中止本轮删除，仅刷新 alive 元数据并 `log.Printf` 强告警，避免单点故障导致批量误删灾难。小库（`total<20`）直通删除避免误触发
+
+### Added
+
+- `PROXY2SUB_MAX_DEAD_RATIO` 环境变量：单轮删除熔断阈值百分比（`0` 禁用，默认 `50`）。
+
 ## [0.1.5] - 2026-08-19
 
 ### Fixed
@@ -9,7 +24,7 @@
 - **v0.1.4 `checkOnce` 死锁 / 多轮叠加**：`testConcurrent` 同步 `wg.Wait()` 等待所有测活完成，但 sing-box 内部 syscall 泄漏（QUIC/UTLS/DNS 底层 socket）不响应 ctx 取消，单节点测活永久阻塞 → 后续节点在 `sem <- struct{}{}` 处永久卡住 → `wg.Wait()` 永不返回 → `checkOnce` 卡死，每 10min ticker 叠加新一轮最终 OOM。([#5](https://github.com/chao2hang/proxy2sub/issues/5))
 
   现重写并发模型：
-  - `sem <- struct{}{}` 移入 goroutine 内 + `select default` 跳过（信号量满的节点本轮直接标 `dead/skipped: concurrency full` 留待下轮再测），主循环不再阻塞
+  - `sem <- struct{}{}` 移入 goroutine 内 + `select default` 跳过（信号量满的节点本轮直接标 `skipped` 留待下轮再测），主循环不再阻塞
   - 全局 `testCtx = TestTimeout*3 + 30s` 兜底，轮询 `done` 计数；deadline 一到立即 return，不再等泄漏 goroutine
   - 最佳努力 `go wg.Wait()` 在后台清点泄漏（不阻塞 checkOnce 返回）
   - `safeCheckOnce` 加 `atomic.Bool.CompareAndSwap` 单飞：上一轮未结束则本轮 `skip, previous round still running` 立即返回，避免多轮叠加

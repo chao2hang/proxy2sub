@@ -265,13 +265,14 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 	for _, it := range items {
 		go func(it *pushItem) {
 			defer wg.Done()
-			// 非阻塞抢信号量：抢不到则本轮跳过（pending 节点留待下轮再测）
+			// 非阻塞抢信号量：抢不到则本轮跳过（pending 节点留待下轮再测）。
+			// 关键：本轮未测到 ≠ 节点 dead，不能贴 dead/delete（见 #6 —— 否则会
+			// 把 keep-alive 的 ss/socks 之外的 TCP 协议全量误删）。
+			// 仅记 "skipped"，删除判定由 checkOnce 的 dead-only 条件负责。
 			select {
 			case sem <- struct{}{}:
 			default:
-				it.status = "dead"
-				it.reason = "unreachable"
-				it.detail = "skipped: concurrency full"
+				it.status = "skipped"
 				atomic.AddInt32(&done, 1)
 				return
 			}
@@ -322,6 +323,15 @@ func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 
 // checkOnce 周期测活：失效删除，存活更新结果。
 // 返回 total/alive/dead 计数（供 /api/check 同步模式使用）。
+//
+// 删除规则 (见 #6)：
+//   - 仅删除 status == "dead" 的节点（确认 sing-box 失败 / panics）
+//   - "pending"（未测到）/ "skipped"（sem 满本轮跳过）/ ""（默认值）全部保留
+//   - 全局 deadline 触发时残留的未完成项保持 status 原值，会被保留
+//
+// 删除熔断：单轮 dead/total 比例超过 MaxDeadRatioPct（默认 50%）时中止删除，
+// 整轮只刷新 alive 元数据，避免类似 v0.1.5 的批量误删（见 #6 复盘 2555→17）。
+// 阈值 0 = 禁用熔断。小库（total<20）直通删除，避免误触发熔断。
 func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 	nodes, err := s.store.All()
 	if err != nil {
@@ -352,22 +362,37 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 	var dead []int64
 	for _, it := range items {
 		n := it.node
-		if it.status != "alive" {
-			dead = append(dead, n.ID)
+		if it.status == "alive" {
+			alive++
+			n.LatencyMS = it.latency
+			n.LastCheck = now
+			if a := ipToAddr(n.IP); a.IsValid() {
+				if cc, ok := ccMap[a]; ok && cc != "ZZ" {
+					n.Country = cc
+				}
+			}
+			n.SetName()
+			if uerr := s.store.UpdateResult(n); uerr != nil {
+				log.Printf("periodic check: update %d: %v", n.ID, uerr)
+			}
 			continue
 		}
-		alive++
-		n.LatencyMS = it.latency
-		n.LastCheck = now
-		if a := ipToAddr(n.IP); a.IsValid() {
-			if cc, ok := ccMap[a]; ok && cc != "ZZ" {
-				n.Country = cc
-			}
+		// 仅显式 "dead" 进入删除队列（见上注释）
+		if it.status == "dead" {
+			dead = append(dead, n.ID)
 		}
-		n.SetName()
-		if uerr := s.store.UpdateResult(n); uerr != nil {
-			log.Printf("periodic check: update %d: %v", n.ID, uerr)
-		}
+	}
+	// 删除熔断：单轮 dead/total 比例超阈值时中止整轮删除，避免单点故障导致批量误删。
+	ratioPct := 0
+	if total := len(nodes); total > 0 {
+		ratioPct = len(dead) * 100 / total
+	}
+	if s.cfg.MaxDeadRatioPct > 0 && len(nodes) >= 20 && ratioPct > s.cfg.MaxDeadRatioPct {
+		log.Printf("periodic check: ABORT deletion: dead=%d total=%d ratio=%d%% > %d%% (nodes kept untouched, will retry next round)",
+			len(dead), len(nodes), ratioPct, s.cfg.MaxDeadRatioPct)
+		// 不删任何 ID；deadCount 计为 0 表示本轮没真正删除任何节点
+		log.Printf("periodic check: total=%d alive=%d dead=%d", len(nodes), alive, 0)
+		return len(nodes), alive, 0
 	}
 	for _, id := range dead {
 		if derr := s.store.Delete(id); derr != nil {

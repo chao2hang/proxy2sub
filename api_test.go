@@ -305,7 +305,8 @@ func TestTestConcurrentGlobalDeadline(t *testing.T) {
 	}
 	done := 0
 	for _, it := range items {
-		if it.status == "alive" || it.status == "dead" {
+		// #6 起 "skipped" 也是合法终态（sem-full 跳过），并非 bug
+		if it.status == "alive" || it.status == "dead" || it.status == "skipped" {
 			done++
 		}
 	}
@@ -314,7 +315,8 @@ func TestTestConcurrentGlobalDeadline(t *testing.T) {
 	}
 }
 
-// TestTestConcurrentSkipsWhenSemFull：信号量满时多余节点被立即标记 dead，下轮再测。
+// TestTestConcurrentSkipsWhenSemFull：信号量满时多余节点被立即标记 skipped，留待下轮再测。
+// 关键回归（#6）：sem-full 节点 *不能* 被标 dead —— 否则 checkOnce 会批量误删。
 func TestTestConcurrentSkipsWhenSemFull(t *testing.T) {
 	// 用一个让 goroutine 抢到信号量后阻塞 200ms 的 tester，
 	// 确保 sem 在 200ms 内始终被 2 个 goroutine 占住，
@@ -332,10 +334,8 @@ func TestTestConcurrentSkipsWhenSemFull(t *testing.T) {
 		switch it.status {
 		case "alive":
 			alive++
-		case "dead":
-			if it.detail == "skipped: concurrency full" {
-				skipped++
-			}
+		case "skipped":
+			skipped++
 		}
 	}
 	if skipped == 0 {
@@ -343,6 +343,12 @@ func TestTestConcurrentSkipsWhenSemFull(t *testing.T) {
 	}
 	if alive+skipped != 5 {
 		t.Fatalf("alive+skipped != 5: alive=%d skipped=%d", alive, skipped)
+	}
+	// 防回归（#6）：任何 item 都不应被标 "dead"，否则会被 checkOnce 当 dead 删。
+	for _, it := range items {
+		if it.status == "dead" {
+			t.Fatalf("sem-full item marked dead (v0.1.5 #6 regression): %+v", it)
+		}
 	}
 }
 
@@ -387,5 +393,159 @@ func TestSafeCheckOnceSkipsWhileRunning(t *testing.T) {
 		// done 计数到 2 → testConcurrent 正常返回。
 	case <-time.After(2 * time.Second):
 		t.Fatalf("testConcurrent deadlocked (this is the #5 bug)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #6：testConcurrent sem-full / deadline 残留 & checkOnce 删除熔断
+// ---------------------------------------------------------------------------
+
+// failTester 永远返回错误（模拟节点确认 dead），用于触发删除熔断测试。
+type failTester struct{}
+
+func (failTester) Test(ctx context.Context, n *Node) (time.Duration, error) {
+	return 0, fmt.Errorf("simulated failure: %s", n.Name)
+}
+
+// makeNodes 生成 N 个入库节点（用于 checkOnce 集成测试）。
+func makeNodes(store *Store, n int) {
+	for i := 0; i < n; i++ {
+		node := &Node{
+			Protocol:  "vless",
+			Server:    fmt.Sprintf("10.%d.%d.%d", i/256, i%256, i%16),
+			Port:      443,
+			Name:      fmt.Sprintf("n%d", i),
+			IP:        fmt.Sprintf("10.%d.%d.%d", i/256, i%256, i%16),
+			Country:   "ZZ",
+			LatencyMS: 0,
+			CreatedAt: time.Now().Unix(),
+		}
+		if err := store.Insert(node); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// TestTestConcurrentDeadlineLeavesPending：全局 deadline 触发时未测到的 item
+// 必须保持 status 原值（"pending" / "skipped"），绝不能被默默标 dead（#6 误删源头 ②）。
+//
+// 构造思路：用一个忽略 ctx 永久阻塞的 tester，模拟 sing-box 内部 syscall 泄漏；
+// 配合短 deadline 父 ctx 强制触发 testConcurrent 的全局 deadline 分支返回。
+// 此时只有拿到 sem 的极少数 goroutine 进入 tester.Test 并永远卡住；
+// 其它要么走 sem-full default 分支，要么处于 pending —— 都不应被标 dead。
+func TestTestConcurrentDeadlineLeavesPending(t *testing.T) {
+	ht := &hangTester{}
+	srv, _, _ := newTestServer(t, withTester(ht), withCfg(func(c *Config) {
+		c.TestTimeout = 1 * time.Second
+		c.Concurrency = 2
+	}))
+	items := makeItems(5)
+	// 短 deadline 父 ctx → testCtx 的 min(parent_deadline, now+30.15s) 触发前者
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer parentCancel()
+	done := make(chan struct{})
+	go func() {
+		srv.testConcurrent(parentCtx, items)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("testConcurrent didn't return after global deadline")
+	}
+	dead := 0
+	for _, it := range items {
+		if it.status == "dead" {
+			dead++
+		}
+	}
+	if dead > 0 {
+		t.Fatalf("deadline-residual items marked dead (v0.1.5 #6 regression): %d/5 dead", dead)
+	}
+}
+
+// hangTester 永远阻塞，忽略 ctx —— 模拟 sing-box 内部 syscall 泄漏（#5/#6 复现）。
+// 测试结束由 Go runtime 清理泄漏 goroutine。
+type hangTester struct{}
+
+func (hangTester) Test(ctx context.Context, n *Node) (time.Duration, error) {
+	<-make(chan struct{}) // 永久阻塞，ctx 不生效
+	return 0, nil
+}
+
+// TestCheckOnceAbortsOnMassDeath：>50% dead 比例触发 MaxDeadRatioPct=50 熔断，
+// 整轮不删任何节点，避免 v0.1.5 类批量误删灾难（#6 期望 #4：二道防线）。
+func TestCheckOnceAbortsOnMassDeath(t *testing.T) {
+	srv, store, _ := newTestServer(t,
+		withTester(&slowFailTester{hold: 20 * time.Millisecond}),
+		withCfg(func(c *Config) {
+			c.MaxDeadRatioPct = 50
+			c.Concurrency = 200 // 大于 items 数，所有节点真正进 tester 测试
+		}),
+	)
+	makeNodes(store, 100)
+	before, _ := store.Count()
+	total, alive, dead := srv.checkOnce(context.Background())
+	after, _ := store.Count()
+	if after != before {
+		t.Fatalf("mass-death should NOT delete any rows: before=%d after=%d (dead=%d alive=%d total=%d)",
+			before, after, dead, alive, total)
+	}
+	if dead != 0 {
+		t.Fatalf("expected deadCount=0 after abort, got %d", dead)
+	}
+}
+
+// TestCheckOnceNormalDelete：熔断未触发时正常 dead-only 删除（基线）。
+// 用 slowFailTester + Concurrency=10 确保 10 节点全进测试通道，不会被 sem-full 跳过。
+func TestCheckOnceNormalDelete(t *testing.T) {
+	srv, store, _ := newTestServer(t,
+		withTester(&slowFailTester{hold: 30 * time.Millisecond}),
+		withCfg(func(c *Config) {
+			c.MaxDeadRatioPct = 50
+			c.Concurrency = 10
+		}),
+	)
+	makeNodes(store, 10)
+	total, alive, dead := srv.checkOnce(context.Background())
+	if total != 10 {
+		t.Fatalf("total=%d want 10", total)
+	}
+	if dead != 10 || alive != 0 {
+		t.Fatalf("expected all 10 dead with failTester: alive=%d dead=%d", alive, dead)
+	}
+	after, _ := store.Count()
+	if after != 0 {
+		t.Fatalf("expected empty store after delete, got %d", after)
+	}
+}
+
+// TestCheckOnceDisabledGuard：MaxDeadRatioPct=0 时熔断禁用（80% 也照删），
+// 给运维一个显式 opt-out 的口子（#6 风险点讨论 #1）。
+func TestCheckOnceDisabledGuard(t *testing.T) {
+	srv, store, _ := newTestServer(t,
+		withTester(&slowFailTester{hold: 30 * time.Millisecond}),
+		withCfg(func(c *Config) {
+			c.MaxDeadRatioPct = 0 // 禁用
+			c.Concurrency = 10
+		}),
+	)
+	makeNodes(store, 10)
+	srv.checkOnce(context.Background())
+	after, _ := store.Count()
+	if after != 0 {
+		t.Fatalf("guard disabled but kept dead nodes: after=%d", after)
+	}
+}
+
+// slowFailTester 阻塞 hold 后再返回错误，确保并发槽位稳定持续占满。
+type slowFailTester struct{ hold time.Duration }
+
+func (s *slowFailTester) Test(ctx context.Context, n *Node) (time.Duration, error) {
+	select {
+	case <-time.After(s.hold):
+		return 0, fmt.Errorf("simulated failure: %s", n.Name)
+	case <-ctx.Done():
+		return 0, ctx.Err()
 	}
 }
