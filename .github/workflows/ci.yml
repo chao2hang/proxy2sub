@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (with_utls with_quic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Vet
+        run: go vet -tags "with_utls with_quic" ./...
+
+      - name: Unit tests
+        run: go test -tags "with_utls with_quic" -count=1 ./...
+
+      - name: Integration tests (real binary + probe subprocess)
+        env:
+          PROXY2SUB_INTEGRATION: '1'
+        run: go test -tags "with_utls with_quic" -count=1 -v -run 'TestIntegration' ./...

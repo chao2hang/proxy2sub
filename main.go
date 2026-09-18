@@ -12,6 +12,13 @@ import (
 )
 
 func main() {
+	// `probe` 子命令：子进程隔离测活（见 #10 与 probe.go）。
+	// 由 SubprocessTester 以 `proxy2sub probe` 启动，stdin 收节点 JSON。
+	if len(os.Args) > 1 && os.Args[1] == "probe" {
+		runProbe()
+		return
+	}
+
 	cfg := loadConfig()
 
 	store, err := OpenStore(cfg.DBPath)
@@ -29,12 +36,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("tester: %v", err)
 	}
-
+	// 子进程隔离测活（#10）：每次测活一个 probe 子进程，挂死的探测由父进程在
+	// 2×TestTimeout 硬 kill，主进程不再被卡死的 sing-box 底层调用拖住。
+	exe := probeExePath()
+	if exe == "" {
+		log.Fatalf("probe: cannot resolve executable path (os.Executable)")
+	}
 	srv := &Server{
 		cfg:        cfg,
 		store:      store,
 		geo:        geo,
-		tester:     tester,
+		tester:     NewSubprocessTester(tester, exe, cfg.TestTimeout),
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 	}
 

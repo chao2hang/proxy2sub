@@ -284,11 +284,12 @@ func classifyTestError(err error) string {
 // 每一轮全量节点都会被真实测完——v0.1.6 及之前的"非阻塞抢信号量、抢不到即
 // skipped"只让每轮随机测到 Concurrency 个节点，大库永远测不完、alive 统计失真。
 //
-// 超时语义（见 #5/#6/#9）：
-//   - 单节点硬截止 1.5x TestTimeout，测活器内部还有 TestTimeout 自身超时
+// 超时语义（见 #5/#6/#9/#10）：
+//   - 单节点硬截止 2x TestTimeout（与 SubprocessTester 的硬 kill 上限对齐）
 //   - 全局 deadline 随规模伸缩：3x TestTimeout x ⌈N/Concurrency⌉ + 30s，
 //     到点后未完成的 item 一律标 skipped（保留节点、下轮重测），绝不判 dead
-//   - 卡死在 sing-box 内部的测试由 singbox.go 的看门狗强制 Close 解除（见 #9）
+//   - 挂死在 sing-box 底层调用（kTLS ioctl / QUIC 等，ctx 取消与 Close 均无效）
+//     的测试由子进程隔离兜底：父进程在 2x TestTimeout SIGKILL 子进程（见 #10）
 func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
 	n := len(items)
 	if n == 0 {
@@ -357,7 +358,10 @@ func (s *Server) testItem(testCtx context.Context, it *pushItem) {
 			log.Printf("tester panic on %s: %v\n%s", it.node.Name, r, debug.Stack())
 		}
 	}()
-	perCtx, perCancel := context.WithTimeout(testCtx, time.Duration(float64(s.cfg.TestTimeout)*1.5))
+	// 2×TestTimeout：与 SubprocessTester 的硬 kill 上限对齐（#10）。
+	// 挂死的探测在 2× 时点被父进程 SIGKILL 返回错误，此时 perCtx 恰好到期，
+	// 下方 deadline 分支将其归 skipped（保留节点、下轮重测），绝不判 dead。
+	perCtx, perCancel := context.WithTimeout(testCtx, time.Duration(float64(s.cfg.TestTimeout)*2))
 	defer perCancel()
 	dur, err := s.tester.Test(perCtx, it.node)
 	if err != nil {
@@ -400,6 +404,12 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount, skippe
 	if len(nodes) == 0 {
 		return 0, 0, 0, 0
 	}
+	// 最旧 last_check 优先测（#10 建议 3）：此前按 rowid（入库顺序）排队，
+	// 队列头固定那批节点每轮被重复测、其余饿死（生产 61% 节点 last_check >1d）。
+	// 排序后每轮先覆盖最久未测的节点，全库均匀轮转；LastCheck=0 天然排最前。
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].LastCheck < nodes[j].LastCheck
+	})
 	items := make([]*pushItem, 0, len(nodes))
 	for _, n := range nodes {
 		items = append(items, &pushItem{node: n, status: "pending"})

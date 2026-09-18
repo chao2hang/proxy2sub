@@ -2,6 +2,28 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.8] - 2026-09-18
+
+### Fixed
+
+- **v0.1.7 全量测活未生效：20 worker 全卡在挂死探测上，每轮只完成 22/758 就吃满全局超时（[#10](https://github.com/chao2hang/proxy2sub/issues/10)）**：#9 的看门狗对 sing-box 实例 `Close()` 无法解除卡死的探测——vless+tcp+tls（无 fingerprint 的最常见形态）的 kTLS offload 走内核 ioctl、QUIC 握手深入协议栈底层，在容器化内核上可无限阻塞：ctx 取消打不断，且进行中的握手连接不被 `Box.Close()` 跟踪（`Outbound.Close()` 只关 multiplexDialer/transport，不触及 in-flight dial 的 conn）。生产实测 3 轮 `done=22/756, alive=21, dead=0` 完全一致、worker 挂死 >15min、61% 节点 `last_check` >1 天。
+
+  进程内已无可靠手段约束单次探测生命周期（#5 全局 deadline → #9 看门狗均未触底），现改为**子进程隔离测活**，用进程边界（SIGKILL 必然生效）替代进程内兜底：
+
+  - 新增 `probe` 隐藏子命令：每次测活启动一个 `proxy2sub probe` 子进程（节点 JSON 走 stdin，结果 JSON 走 stdout），`Tester`/看门狗等原有逻辑在子进程内原样运行
+  - 父进程 `exec.CommandContext` 在 `2×PROXY2SUB_TEST_TIMEOUT` 硬 kill 子进程：`TestTimeout` 内干净返回的（成功 / 协议失败 / 可取消超时）按原逻辑归类；超过 `2×timeout` 仍不返回的（挂死）直接 SIGKILL，内核全量回收 fd/内存/goroutine——主进程不再被卡死调用拖住，也彻底消除 #9 类实例泄漏
+  - **挂死语义（#6 延续）**：被硬 kill 的挂死探测标 `skipped`（保留节点、下轮重测），绝不判 dead——挂死≠节点死亡（issue 实测挂死组 13/25 端口可 TCP 连通）；干净超时（dial 超时等）仍标 `dead(unreachable)`，真死节点由此可被正常标记与清理，解决 `dead=0` 恒成立、死节点永不清理的问题
+  - 不支持传输（`vmess/trojan+tcp+http`，#7）在父进程轻量短路，不启动子进程
+  - 父进程被杀时孤立的子进程会在自身 `TestTimeout` 到期后自行退出，不残留；单进程 `GOMEMLIMIT=256MiB`
+  - 实测开销：子进程启动 <100ms、空闲 RSS ≈22MB、单次探测端到端 ~24ms；758 节点 / concurrency=20 每轮约多 10–15s。内存口径变为突发 `concurrency × ~35MB`（探测完即退出），小内存主机可调低 `PROXY2SUB_CONCURRENCY`
+
+- **固定 22 个节点每轮重复测、其余饿死（[#10](https://github.com/chao2hang/proxy2sub/issues/10) 建议 3）**：周期测活原按 rowid（入库顺序）排队，队列头固定那批节点每轮被重复测（两轮刷新并集仅 23 个节点），735 个节点永远轮不到。现队列按 `last_check` 升序（最旧优先），每轮先覆盖最久未测的节点，全库均匀轮转。
+
+### Changed
+
+- `testItem` 单节点硬截止由 `1.5×TestTimeout` 调整为 `2×TestTimeout`，与子进程硬 kill 上限对齐：挂死探测被 kill 返回时 `perCtx` 恰好到期，按 deadline 分支归 `skipped`（保留、下轮重测），不判 dead。
+- 新增 CI（`.github/workflows/ci.yml`）：main 推送 / PR / tag 均跑 `go vet` + 全量单测 + 集成测试（真实二进制端到端：alive / 闭合端口快速失败 / UDP 黑洞挂死有界）。
+
 ## [0.1.7] - 2026-09-18
 
 ### Fixed

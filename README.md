@@ -145,9 +145,9 @@ v2rayN / Clash 客户端的订阅地址均填写：`http://<host>:<port>/sub`
 | `PROXY2SUB_SUB_TOKEN` | 空 | 订阅接口 token |
 | `PROXY2SUB_CHECK_INTERVAL` | `10m` | 周期测活间隔（如 `5m`、`30s`） |
 | `PROXY2SUB_CHECK_ON_START` | `false` | 启动 3 秒后先跑一轮测活；周期任务自带 panic recover，畸形节点不会杀死 ticker goroutine |
-| `PROXY2SUB_TEST_TIMEOUT` | `8s` | 单节点测活超时 |
+| `PROXY2SUB_TEST_TIMEOUT` | `8s` | 单节点测活超时；超过 `2×该值` 仍未返回的挂死探测会被父进程硬 kill（标 `skipped` 保留） |
 | `PROXY2SUB_TEST_URL` | `http://www.gstatic.com/generate_204` | 测活目标（经代理访问） |
-| `PROXY2SUB_CONCURRENCY` | `20` | 测活并发数（worker-pool worker 数）。每轮会全量测完所有节点，一轮耗时约 `⌈N/并发⌉ × 超时`；节点数较大（>500）时可调大该值缩短单轮耗时 |
+| `PROXY2SUB_CONCURRENCY` | `20` | 测活并发数（worker-pool worker 数）。每轮会全量测完所有节点，一轮耗时约 `⌈N/并发⌉ × 超时`；节点数较大（>500）时可调大该值缩短单轮耗时。v0.1.8 起每次测活是独立子进程（≈35MB RSS，探测完即退出），内存峰值约 `并发 × 35MB` 突发，小内存主机建议调低 |
 | `PROXY2SUB_MAX_DEAD_RATIO` | `50` | 单轮删除熔断阈值（百分比）。`dead/total` 超过该值时中止本轮删除并告警，避免类似 #6 类批量误删灾难。设 `0` 禁用熔断。仅在 `total >= 20` 时生效 |
 | `PROXY2SUB_GEOIP_DB` | 空 | 本地 mmdb 文件路径（缺省读取同目录 `Country.mmdb`，都没有则用 ip-api.com 在线接口） |
 
@@ -172,12 +172,14 @@ curl -L -o Country.mmdb https://github.com/Loyalsoldier/geoip/releases/latest/do
 
 ### 测活机制与限制
 
+每次测活在一个独立 `probe` 子进程中执行（v0.1.8 起，#10）：子进程在 `PROXY2SUB_TEST_TIMEOUT` 内干净返回则按结果归类；超过 `2×超时` 仍不返回（sing-box 底层调用挂死，ctx 取消无法解除）由父进程 SIGKILL，主进程不受影响、无泄漏。
+
 | 场景 | 行为 |
 | --- | --- |
-| 常规协议与传输层（ws/grpc/h2/reality 等） | sing-box 真实建连访问测活目标 |
+| 常规协议与传输层（ws/grpc/h2/reality 等） | 子进程内经 sing-box 真实建连访问测活目标 |
 | `vless+tcp` + `headerType=http`（联通绿通等 HTTP 头伪装） | sing-box 无此传输，p2s 内置轻量 VLESS+HTTP-obfs 探测器（伪装请求 + VLESS 握手 + 隧道内 HTTP GET，支持 tcp / tcp+tls） |
 | `vmess+tcp` + `headerType=http` | 协议加密无法在 p2s 内独立握手，标 `skipped` 保留（不判 dead、不入库） |
-| 测活卡死（sing-box 内部 syscall 不响应取消） | 看门狗在 `2×超时` 后强制关闭 sing-box 实例，goroutine 得以退出，不泄漏内存（v0.1.7 修复 #9） |
+| 探测挂死（kTLS ioctl / QUIC 等底层阻塞，ctx 取消与 Close 均无效） | `2×超时` 父进程 SIGKILL 子进程，节点标 `skipped` 保留、下轮重测（挂死≠节点死亡，不判 dead）；干净超时的正常判 `dead(unreachable)`（v0.1.8 修复 #10） |
 | 全局 deadline 截断 / 单节点 deadline | 节点标 `skipped` 保留原状态，下轮重测；**绝不因超时截断判 dead**（#6） |
 | 单轮 `dead/total` 超过 `PROXY2SUB_MAX_DEAD_RATIO` | 熔断：整轮不删除，仅刷新存活元数据并告警 |
 
