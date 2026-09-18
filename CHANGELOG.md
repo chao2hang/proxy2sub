@@ -2,6 +2,28 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.7] - 2026-09-18
+
+### Fixed
+
+- **长期运行内存持续增长（#9）**：#5 的全局 deadline 兜底让 `checkOnce` 不再无限等待，但 deadline 时仍卡在 sing-box 内部 syscall（QUIC/UTLS/DNS 底层 socket，不响应 ctx 取消）的测活 goroutine 从此无人接管——`Test` 不返回则 `defer inst.Close()` 永不执行，每个卡死的测试永久泄漏一个完整 sing-box 实例（注册表 context、内部 goroutine、缓冲区、fd），GC 无法回收，`GOMEMLIMIT` 无效；~753 节点 / `concurrency=20` 实测 29 天 RSS 从 ~55MB 涨到数 GB。
+
+  现为 `Tester.Test` 挂 `time.AfterFunc(2×TestTimeout)` 看门狗：超时后从外部强制 `inst.Close()`——关闭 outbound 解除卡死的 dial，goroutine 得以返回并走完清理。`sync.Once` 保证 Close 只执行一次；sing-box `Box.Close` 内部 done channel 对二次关闭直接返回 `os.ErrClosed`，并发/幂等语义安全。
+
+  同时修正 deadline 日志文案（原 `714/723 items unresolved` 实际含义是"完成 714、剩 7 个"，极易误读为 714 个泄漏）与 `/healthz`、`/api/stats` 可观测性（见 Added）。
+- **大库周期检查永远测不完、alive 统计失真（#8）**：`testConcurrent` 的"非阻塞抢信号量、抢不到即 skipped"使每轮只随机测到 Concurrency 个节点（1446 节点 × 10min 周期 = 每轮随机抽样 20 个），其余瞬间 skipped 且无"未测优先"逻辑，alive 统计只反映当轮被抽到的节点。
+
+  现重写为 **worker-pool**：固定 Concurrency 个 worker 从队列逐个领取节点，**每轮全量节点都被真实测完**；全局 deadline 随规模伸缩（`3×TestTimeout×⌈N/Concurrency⌉ + 30s`）；deadline 截断的节点标 `skipped`（保留、下轮重测），绝不判 dead。push 与周期检查共用该路径，push 响应与日志同步区分 `skipped`（v0.1.6 及之前 skipped 节点在 push 中被计入 dead）。
+- **联通绿通节点测活误判 dead（#7）**：`vless+tcp+headerType=http`（HTTP 头伪装）与 `vmess+ws+host` 伪装节点 TCP 连通但 p2s 判 dead、无法入库。实测确认 sing-box v1.13 的 v2ray 传输层仅支持 http(h2)/ws/quic/grpc/httpupgrade，**不支持 v2ray 的 tcp+HTTP 头伪装**，标准协议探测对这些节点必然超时。
+
+  现按 v2ray-core `transport/internet/headers/http` 协议语义自实现轻量探测器（`obfsprobe.go`）：发伪装 HTTP 请求 + VLESS 握手 + 隧道内 HTTP GET，服务端 404/400 错误模板（已对真实绿通服务器联调核对）快速判 dead，VLESS 响应头 + 隧道状态码判 alive；支持 tcp / tcp+tls 两种形态。`vmess` 的 tcp+http 伪装因协议加密无法独立握手，标 `skipped` 保留不删（`errUnsupportedTransport`）。订阅输出完整往返：v2ray URI 携带 `headerType`/`type`，Clash 输出 `network: http` + `http-opts`。另修复 ws 传输向 sing-box 下发空 `Host: ""` 头的问题（节点无 host 时不再干扰握手）。
+- **周期检查误删节点收尾（#6）**：在 v0.1.6 修复（sem-full 不再标 dead + 删除熔断）基础上，deadline 截断的在飞测试现统一标 `skipped`（此前 per-ctx 取消错误会被标 dead 进入删除队列），实现"超时未完成 ≠ 节点失败，保留原状态下轮重测"的完整语义；pushItem 结果读写加锁，消除 deadline 残留 goroutine 迟到写入与主流程读取的数据竞争。
+
+### Added
+
+- `/healthz` 与 `/api/stats` 新增 `goroutines` 字段（`runtime.NumGoroutine()`）：健康实例稳定在低位，测活 goroutine 泄漏时线性上涨，可据此提前告警（#9 建议的可观测性）。
+- `POST /api/push` 响应与日志新增 `skipped` 计数（deadline 截断 / 不支持传输，未入库、非 dead）；`POST /api/check` 同步响应新增 `skipped`。
+
 ## [0.1.6] - 2026-08-19
 
 ### Fixed

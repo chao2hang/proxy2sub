@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box"
@@ -71,6 +72,22 @@ func (t *Tester) Test(ctx context.Context, n *Node) (time.Duration, error) {
 	ctx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 
+	// tcp+http 头伪装（联通绿通等，见 #7）：sing-box 无该传输。
+	// vless 走自实现探测；vmess/trojan 因协议加密或握手差异无法在 p2s 内独立
+	// 握手，标记为不支持（保留不删，绝不判 dead）。
+	if (n.Network == "tcp" || n.Network == "") && n.HeaderType == "http" {
+		switch n.Protocol {
+		case "vless":
+			return t.probeVlessHTTPObfs(ctx, n)
+		case "vmess", "trojan":
+			return 0, errUnsupportedTransport
+		}
+	}
+	return t.testSingbox(ctx, n)
+}
+
+// testSingbox 经 sing-box 真实建连访问测活目标。
+func (t *Tester) testSingbox(ctx context.Context, n *Node) (time.Duration, error) {
 	// 每个实例使用独立的注册表 context，避免并发 Box 相互覆盖
 	bctx := box.Context(ctx,
 		include.InboundRegistry(),
@@ -87,7 +104,21 @@ func (t *Tester) Test(ctx context.Context, n *Node) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("init singbox: %w", err)
 	}
-	defer inst.Close()
+	// 看门狗（见 #9）：sing-box 内部 syscall（QUIC/UTLS/DNS 底层 socket）可能不响应
+	// ctx 取消，Test 永不返回 → 原先 defer 的 Close 永不执行 → 实例（注册表 context、
+	// 内部 goroutine、缓冲区、fd）永久泄漏，RSS 数周内涨到数 GB。
+	// 这里在 2x timeout 后从外部强制 Close outbound：关闭解除卡死的 dial，goroutine
+	// 得以返回并走完 defer 清理。sync.Once 保证只 Close 一次；sing-box Box.Close 对
+	// 已关闭实例（done channel）直接返回 os.ErrClosed，并发/二次调用天然安全。
+	if t.timeout > 0 {
+		var closeOnce sync.Once
+		closeInst := func() { closeOnce.Do(func() { _ = inst.Close() }) }
+		watchdog := time.AfterFunc(2*t.timeout, closeInst)
+		defer watchdog.Stop()
+		defer closeInst()
+	} else {
+		defer inst.Close()
+	}
 	if err := inst.Start(); err != nil {
 		return 0, fmt.Errorf("start singbox: %w", err)
 	}
@@ -264,15 +295,21 @@ func singboxOutbound(n *Node) map[string]any {
 
 	switch n.Network {
 	case "ws":
-		ws := map[string]any{"path": n.Path}
+		// Host 头仅在显式配置时下发；sing-box ws 客户端对空 Host 会回退为服务器地址，
+		// 但下发 {"Host": ""} 既无意义也可能干扰握手（v0.1.6 及之前会带上空值）。
+		transport := map[string]any{"type": "ws", "path": n.Path}
 		if n.Host != "" {
-			ws["headers"] = map[string]any{"Host": n.Host}
+			transport["headers"] = map[string]any{"Host": n.Host}
 		}
-		m["transport"] = map[string]any{"type": "ws", "path": n.Path, "headers": map[string]any{"Host": n.Host}}
+		m["transport"] = transport
 	case "grpc":
 		m["transport"] = map[string]any{"type": "grpc", "service_name": orDefault(n.Service, n.Path)}
 	case "h2":
-		m["transport"] = map[string]any{"type": "http", "host": []string{n.Host}, "path": n.Path}
+		t2 := map[string]any{"type": "http", "path": n.Path}
+		if n.Host != "" {
+			t2["host"] = []string{n.Host}
+		}
+		m["transport"] = t2
 	}
 	return m
 }

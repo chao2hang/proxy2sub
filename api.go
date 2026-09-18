@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/netip"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -34,14 +36,41 @@ type TesterIface interface {
 	Test(ctx context.Context, n *Node) (time.Duration, error)
 }
 
-// pushItem 一次推送中单条线路的状态。
+// pushItem 一次推送/周期测活中单条线路的状态。
+// status/reason/detail/latency 由测活 goroutine 写入、请求/周期 goroutine 读取；
+// 全局 deadline 后残留 goroutine 仍可能迟到写入（卡死的 sing-box 实例被看门狗
+// 解除后才返回，见 #9），因此用互斥锁保护，保证 checkOnce/handlePush 读取时
+// 不与迟到写入构成数据竞争。
 type pushItem struct {
-	link    string
-	node    *Node
-	status  string // pending / alive / dead / added / duplicate / invalid
-	detail  string
+	link string
+	node *Node
+
+	mu      sync.Mutex
+	status  string // pending / alive / dead / skipped / added / duplicate / invalid
 	reason  string // dead / unreachable（仅 status=dead 时有意义）
+	detail  string
 	latency int64
+}
+
+// finish 由测活 goroutine 写入最终结果（仅补空字段，不覆盖已有非空值）。
+func (it *pushItem) finish(status, reason, detail string, latency int64) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	it.status = status
+	if reason != "" {
+		it.reason = reason
+	}
+	if detail != "" {
+		it.detail = detail
+	}
+	it.latency = latency
+}
+
+// snapshot 读取当前结果。
+func (it *pushItem) snapshot() (status, reason, detail string, latency int64) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	return it.status, it.reason, it.detail, it.latency
 }
 
 func ipToAddr(s string) netip.Addr {
@@ -89,6 +118,7 @@ type pushResponse struct {
 	Duplicates int          `json:"duplicates"`
 	Alive      int          `json:"alive"`
 	Dead       int          `json:"dead"`
+	Skipped    int          `json:"skipped,omitempty"` // 本轮未完成测活（deadline 截断/不支持传输），未入库
 	Added      int          `json:"added"`
 	Results    []pushResult `json:"results,omitempty"`
 }
@@ -159,21 +189,19 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 测活（入库前，活的才放行）。
-	// 使用独立超时 context：即使客户端提前断开，也把测活与入库做完。
+	// 全局 deadline 由 testConcurrent 内部按规模计算；即使客户端提前断开，也把测活与入库做完。
 	var pending []*pushItem
 	for _, it := range items {
-		if it.status == "pending" {
+		if it.node != nil && it.status == "pending" {
 			pending = append(pending, it)
 		}
 	}
-	testCtx, cancel := context.WithTimeout(context.Background(), s.cfg.TestTimeout*3+30*time.Second)
-	defer cancel()
-	s.testConcurrent(testCtx, pending)
+	s.testConcurrent(context.Background(), pending)
 
 	// 地理识别 + 入库
 	var addrs []netip.Addr
 	for _, it := range pending {
-		if it.status == "alive" {
+		if st, _, _, _ := it.snapshot(); st == "alive" {
 			if a := ipToAddr(it.node.ResolveServerIP()); a.IsValid() {
 				addrs = append(addrs, a)
 			}
@@ -183,8 +211,10 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	for _, it := range pending {
 		n := it.node
-		if it.status == "alive" {
+		st, _, _, lat := it.snapshot()
+		if st == "alive" {
 			resp.Alive++
+			n.LatencyMS = lat
 			if a := ipToAddr(n.IP); a.IsValid() {
 				if cc, ok := ccMap[a]; ok {
 					n.Country = cc
@@ -194,7 +224,6 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 				n.Country = "ZZ"
 			}
 			n.SetName()
-			n.LatencyMS = it.latency
 			n.CreatedAt = now
 			n.LastCheck = now
 			if ierr := s.store.Insert(n); ierr != nil {
@@ -202,8 +231,9 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			resp.Added++
-			it.status = "added"
-			it.detail = n.Name
+			it.finish("added", "", n.Name, lat)
+		} else if st == "skipped" {
+			resp.Skipped++
 		} else {
 			resp.Dead++
 		}
@@ -212,13 +242,14 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("detail") == "1" {
 		resp.Results = make([]pushResult, 0, len(items))
 		for _, it := range items {
+			st, reason, detail, lat := it.snapshot()
 			resp.Results = append(resp.Results, pushResult{
-				Link: it.link, Status: it.status, Name: it.detail, Detail: it.detail, Reason: it.reason, Latency: it.latency,
+				Link: it.link, Status: st, Name: detail, Detail: detail, Reason: reason, Latency: lat,
 			})
 		}
 	}
-	log.Printf("push: received=%d parsed=%d invalid=%d dup=%d alive=%d dead=%d added=%d",
-		resp.Received, resp.Parsed, resp.Invalid, resp.Duplicates, resp.Alive, resp.Dead, resp.Added)
+	log.Printf("push: received=%d parsed=%d invalid=%d dup=%d alive=%d dead=%d skipped=%d added=%d",
+		resp.Received, resp.Parsed, resp.Invalid, resp.Duplicates, resp.Alive, resp.Dead, resp.Skipped, resp.Added)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -247,101 +278,127 @@ func classifyTestError(err error) string {
 	}
 }
 
-// testConcurrent 并发测活，结果写入 item.status / item.latency。
-// 全局 deadline 兜底：sing-box 内部 syscall 泄漏（QUIC/UTLS/DNS 等）时不会无限等
-// 泄漏 goroutine，而是按当前结果返回（见 #5）。
+// testConcurrent 并发测活，结果写入各 item。
+//
+// worker-pool 模型（见 #8）：固定 Concurrency 个 worker 从队列逐个领取节点测试，
+// 每一轮全量节点都会被真实测完——v0.1.6 及之前的"非阻塞抢信号量、抢不到即
+// skipped"只让每轮随机测到 Concurrency 个节点，大库永远测不完、alive 统计失真。
+//
+// 超时语义（见 #5/#6/#9）：
+//   - 单节点硬截止 1.5x TestTimeout，测活器内部还有 TestTimeout 自身超时
+//   - 全局 deadline 随规模伸缩：3x TestTimeout x ⌈N/Concurrency⌉ + 30s，
+//     到点后未完成的 item 一律标 skipped（保留节点、下轮重测），绝不判 dead
+//   - 卡死在 sing-box 内部的测试由 singbox.go 的看门狗强制 Close 解除（见 #9）
 func (s *Server) testConcurrent(ctx context.Context, items []*pushItem) {
-	if len(items) == 0 {
+	n := len(items)
+	if n == 0 {
 		return
 	}
-	sem := make(chan struct{}, s.cfg.Concurrency)
-	// 全局 deadline：TestTimeout*3 + 30s，与 handlePush 的总超时保持一致
-	testCtx, cancel := context.WithTimeout(ctx, s.cfg.TestTimeout*3+30*time.Second)
+	concurrency := s.cfg.Concurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > n {
+		concurrency = n
+	}
+	batches := (n + concurrency - 1) / concurrency
+	globalTimeout := time.Duration(batches)*3*s.cfg.TestTimeout + 30*time.Second
+	testCtx, cancel := context.WithTimeout(ctx, globalTimeout)
 	defer cancel()
+
+	queue := make(chan *pushItem, n)
+	for _, it := range items {
+		queue <- it
+	}
+	close(queue)
 
 	var done int32
 	var wg sync.WaitGroup
-	wg.Add(len(items))
-	for _, it := range items {
-		go func(it *pushItem) {
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
 			defer wg.Done()
-			// 非阻塞抢信号量：抢不到则本轮跳过（pending 节点留待下轮再测）。
-			// 关键：本轮未测到 ≠ 节点 dead，不能贴 dead/delete（见 #6 —— 否则会
-			// 把 keep-alive 的 ss/socks 之外的 TCP 协议全量误删）。
-			// 仅记 "skipped"，删除判定由 checkOnce 的 dead-only 条件负责。
-			select {
-			case sem <- struct{}{}:
-			default:
-				it.status = "skipped"
+			for it := range queue {
+				s.testItem(testCtx, it)
 				atomic.AddInt32(&done, 1)
-				return
 			}
-			defer func() { <-sem }()
-			defer func() {
-				if r := recover(); r != nil {
-					// 单节点测活 panic：标记为 dead（保守归 unreachable），
-					// 不传染其他节点、不杀整个 checkOnce（见 #4）。
-					it.status = "dead"
-					it.reason = "unreachable"
-					it.detail = fmt.Sprintf("tester panic: %v", r)
-					log.Printf("tester panic on %s: %v\n%s", it.node.Name, r, debug.Stack())
-				}
-				atomic.AddInt32(&done, 1)
-			}()
-			// 单节点硬截止：1.5x TestTimeout，留余量给 sing-box 内部清理
-			perCtx, perCancel := context.WithTimeout(testCtx, time.Duration(float64(s.cfg.TestTimeout)*1.5))
-			dur, err := s.tester.Test(perCtx, it.node)
-			perCancel()
-			if err != nil {
-				it.status = "dead"
-				it.reason = classifyTestError(err)
-				it.detail = err.Error()
-				return
-			}
-			it.status = "alive"
-			it.latency = dur.Milliseconds()
-		}(it)
+		}()
 	}
-	// 轮询等所有节点完成或全局 deadline（不再 wg.Wait 无限等）
-	poll := time.NewTicker(100 * time.Millisecond)
-	defer poll.Stop()
-	expected := int32(len(items))
-	for atomic.LoadInt32(&done) < expected {
-		select {
-		case <-testCtx.Done():
-			log.Printf("periodic check: global deadline hit, %d/%d items unresolved (leaked goroutines left running)",
-				atomic.LoadInt32(&done), expected)
-			return
-		case <-poll.C:
-		}
-	}
-	// 最佳努力清点泄漏 goroutine（不阻塞当前 checkOnce 返回；泄漏 goroutine 终会被 GC）
+	finished := make(chan struct{})
 	go func() {
 		wg.Wait()
+		close(finished)
 	}()
+
+	select {
+	case <-finished:
+		return
+	case <-testCtx.Done():
+	}
+	// 全局 deadline：给在飞测试一小段宽限让它们感知 ctx 取消并写回 skipped，
+	// 避免迟到写入与 checkOnce 的读取重叠；仍卡死的由看门狗事后解除（不阻塞本轮）。
+	grace := time.NewTimer(3 * time.Second)
+	defer grace.Stop()
+	select {
+	case <-finished:
+	case <-grace.C:
+		d := atomic.LoadInt32(&done)
+		log.Printf("periodic check: global deadline hit, %d done / %d expected, %d unresolved (stuck tests will be reaped by watchdog)",
+			d, n, n-int(d))
+	}
+}
+
+// testItem 测活单个节点并写入结果。
+func (s *Server) testItem(testCtx context.Context, it *pushItem) {
+	defer func() {
+		if r := recover(); r != nil {
+			// 单节点测活 panic：保守归 unreachable，不传染其他节点、不杀整个 checkOnce（见 #4）。
+			it.finish("dead", "unreachable", fmt.Sprintf("tester panic: %v", r), 0)
+			log.Printf("tester panic on %s: %v\n%s", it.node.Name, r, debug.Stack())
+		}
+	}()
+	perCtx, perCancel := context.WithTimeout(testCtx, time.Duration(float64(s.cfg.TestTimeout)*1.5))
+	defer perCancel()
+	dur, err := s.tester.Test(perCtx, it.node)
+	if err != nil {
+		if errors.Is(err, errUnsupportedTransport) {
+			// p2s 尚无法验证的传输配置（如 vmess tcp+http 伪装）：保留节点，不判 dead（见 #7）
+			it.finish("skipped", "", err.Error(), 0)
+			log.Printf("tester unsupported transport on %s://%s:%d, node kept untested",
+				it.node.Protocol, it.node.Server, it.node.Port)
+			return
+		}
+		if testCtx.Err() != nil || perCtx.Err() != nil {
+			// 本轮被 deadline 截断 ≠ 节点自身失败：保留，下轮重测（见 #6 期望 1）
+			it.finish("skipped", "", "test deadline: "+err.Error(), 0)
+			return
+		}
+		it.finish("dead", classifyTestError(err), err.Error(), 0)
+		return
+	}
+	it.finish("alive", "", "", dur.Milliseconds())
 }
 
 // checkOnce 周期测活：失效删除，存活更新结果。
-// 返回 total/alive/dead 计数（供 /api/check 同步模式使用）。
+// 返回 total/alive/dead/skipped 计数（供 /api/check 同步模式使用）。
 //
 // 删除规则 (见 #6)：
 //   - 仅删除 status == "dead" 的节点（确认 sing-box 失败 / panics）
-//   - "pending"（未测到）/ "skipped"（sem 满本轮跳过）/ ""（默认值）全部保留
-//   - 全局 deadline 触发时残留的未完成项保持 status 原值，会被保留
+//   - "pending"（未测到）/ "skipped"（deadline 截断 / 不支持传输）/ ""（默认值）全部保留
 //
 // 删除熔断：单轮 dead/total 比例超过 MaxDeadRatioPct（默认 50%）时中止删除，
 // 整轮只刷新 alive 元数据，避免类似 v0.1.5 的批量误删（见 #6 复盘 2555→17）。
 // 阈值 0 = 禁用熔断。小库（total<20）直通删除，避免误触发熔断。
-func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
+func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount, skippedCount int) {
 	nodes, err := s.store.All()
 	if err != nil {
 		log.Printf("periodic check: load: %v", err)
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	log.Printf("periodic check: start total=%d concurrency=%d timeout=%s",
 		len(nodes), s.cfg.Concurrency, s.cfg.TestTimeout)
 	if len(nodes) == 0 {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	items := make([]*pushItem, 0, len(nodes))
 	for _, n := range nodes {
@@ -351,7 +408,7 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 
 	var addrs []netip.Addr
 	for _, it := range items {
-		if it.status == "alive" {
+		if st, _, _, _ := it.snapshot(); st == "alive" {
 			if a := ipToAddr(it.node.ResolveServerIP()); a.IsValid() {
 				addrs = append(addrs, a)
 			}
@@ -362,9 +419,11 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 	var dead []int64
 	for _, it := range items {
 		n := it.node
-		if it.status == "alive" {
+		st, _, _, lat := it.snapshot()
+		switch st {
+		case "alive":
 			alive++
-			n.LatencyMS = it.latency
+			n.LatencyMS = lat
 			n.LastCheck = now
 			if a := ipToAddr(n.IP); a.IsValid() {
 				if cc, ok := ccMap[a]; ok && cc != "ZZ" {
@@ -375,24 +434,23 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 			if uerr := s.store.UpdateResult(n); uerr != nil {
 				log.Printf("periodic check: update %d: %v", n.ID, uerr)
 			}
-			continue
-		}
-		// 仅显式 "dead" 进入删除队列（见上注释）
-		if it.status == "dead" {
+		case "skipped":
+			skippedCount++
+		case "dead":
 			dead = append(dead, n.ID)
 		}
 	}
 	// 删除熔断：单轮 dead/total 比例超阈值时中止整轮删除，避免单点故障导致批量误删。
 	ratioPct := 0
-	if total := len(nodes); total > 0 {
-		ratioPct = len(dead) * 100 / total
+	if nodeTotal := len(nodes); nodeTotal > 0 {
+		ratioPct = len(dead) * 100 / nodeTotal
 	}
 	if s.cfg.MaxDeadRatioPct > 0 && len(nodes) >= 20 && ratioPct > s.cfg.MaxDeadRatioPct {
 		log.Printf("periodic check: ABORT deletion: dead=%d total=%d ratio=%d%% > %d%% (nodes kept untouched, will retry next round)",
 			len(dead), len(nodes), ratioPct, s.cfg.MaxDeadRatioPct)
 		// 不删任何 ID；deadCount 计为 0 表示本轮没真正删除任何节点
-		log.Printf("periodic check: total=%d alive=%d dead=%d", len(nodes), alive, 0)
-		return len(nodes), alive, 0
+		log.Printf("periodic check: total=%d alive=%d dead=%d skipped=%d", len(nodes), alive, 0, skippedCount)
+		return len(nodes), alive, 0, skippedCount
 	}
 	for _, id := range dead {
 		if derr := s.store.Delete(id); derr != nil {
@@ -401,17 +459,17 @@ func (s *Server) checkOnce(ctx context.Context) (total, alive, deadCount int) {
 	}
 	deadCount = len(dead)
 	total = len(nodes)
-	log.Printf("periodic check: total=%d alive=%d dead=%d", total, alive, deadCount)
-	return total, alive, deadCount
+	log.Printf("periodic check: total=%d alive=%d dead=%d skipped=%d", total, alive, deadCount, skippedCount)
+	return total, alive, deadCount, skippedCount
 }
 
 // safeCheckOnce 包 recover + running 互斥的 checkOnce。
 // - recover：单次 panic 不杀死周期 goroutine（见 #4）
 // - 单飞：上一轮未结束时不启动新一轮，避免泄漏 goroutine 叠加（见 #5）
-func (s *Server) safeCheckOnce(ctx context.Context) (total, alive, dead int) {
+func (s *Server) safeCheckOnce(ctx context.Context) (total, alive, dead, skipped int) {
 	if !s.checkRunning.CompareAndSwap(false, true) {
 		log.Printf("periodic check: skip, previous round still running")
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	defer s.checkRunning.Store(false)
 	defer func() {
@@ -606,15 +664,18 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		byProtocol[n.Protocol]++
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total":    len(nodes),
-		"country":  byCountry,
-		"protocol": byProtocol,
+		"total":      len(nodes),
+		"country":    byCountry,
+		"protocol":   byProtocol,
+		"goroutines": runtime.NumGoroutine(),
 	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	n, _ := s.store.Count()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": n})
+	// goroutines（见 #9）：长期运行的健康实例该值稳定在低位，测活 goroutine 泄漏时
+	// 线性上涨，可据此提前告警，避免数周后内存耗尽才发现。
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": n, "goroutines": runtime.NumGoroutine()})
 }
 
 // handleCheck 手动触发一轮周期测活（见 #4）。
@@ -638,11 +699,12 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 同步：复用 safeCheckOnce（自带 recover），单节点测活 panic 也不影响整体返回。
-	total, alive, dead := s.safeCheckOnce(r.Context())
+	total, alive, dead, skipped := s.safeCheckOnce(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"total":  total,
-		"alive":  alive,
-		"dead":   dead,
+		"status":  "ok",
+		"total":   total,
+		"alive":   alive,
+		"dead":    dead,
+		"skipped": skipped,
 	})
 }

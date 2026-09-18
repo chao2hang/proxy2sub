@@ -169,8 +169,8 @@ func TestDecodePinSHA256(t *testing.T) {
 	}{
 		{"d2fb4f1b833ee7e77e8304dc4652eb13e1b0e064e0874cde3a1a1a1660b74eef", true},
 		{"", false},
-		{"abc", false},                       // 太短
-		{"zz" + "00", false},                 // 4 字符非 hex
+		{"abc", false},       // 太短
+		{"zz" + "00", false}, // 4 字符非 hex
 		{"d2fb4f1b833ee7e77e8304dc4652eb13e1b0e064e0874cde3a1a1a1660b74e", false}, // 63 字符
 	}
 	for _, c := range cases {

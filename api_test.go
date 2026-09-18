@@ -166,14 +166,14 @@ func TestSafeCheckOnceRecoverLogic(t *testing.T) {
 // TestCheckOnceEmptyStore 验证空库不报错且不 panic（#4 场景）。
 func TestCheckOnceEmptyStore(t *testing.T) {
 	srv, _, _ := newTestServer(t)
-	total, alive, dead := srv.checkOnce(context.Background())
-	if total != 0 || alive != 0 || dead != 0 {
-		t.Fatalf("empty store: got %d/%d/%d, want 0/0/0", total, alive, dead)
+	total, alive, dead, skipped := srv.checkOnce(context.Background())
+	if total != 0 || alive != 0 || dead != 0 || skipped != 0 {
+		t.Fatalf("empty store: got %d/%d/%d/%d, want 0/0/0/0", total, alive, dead, skipped)
 	}
 	// safeCheckOnce 包 recover 后也应正常返回。
-	total, alive, dead = srv.safeCheckOnce(context.Background())
-	if total != 0 || alive != 0 || dead != 0 {
-		t.Fatalf("safeCheckOnce empty: got %d/%d/%d, want 0/0/0", total, alive, dead)
+	total, alive, dead, skipped = srv.safeCheckOnce(context.Background())
+	if total != 0 || alive != 0 || dead != 0 || skipped != 0 {
+		t.Fatalf("safeCheckOnce empty: got %d/%d/%d/%d, want 0/0/0/0", total, alive, dead, skipped)
 	}
 }
 
@@ -279,18 +279,9 @@ func makeItems(n int) []*pushItem {
 	return items
 }
 
-// TestTestConcurrentGlobalDeadline：测试 global deadline 兜底——
-// 当部分 goroutine 永远不 done 时，testConcurrent 在全局 deadline 到达时返回。
+// TestTestConcurrentGlobalDeadline：worker-pool happy path——
+// 全量节点都被测完并写回终态，整体快速返回（#8 起 worker-pool 语义）。
 func TestTestConcurrentGlobalDeadline(t *testing.T) {
-	// 用 slowBlockTester 让所有 3 个节点都占用 800ms，
-	// 配合 Concurrency=3 让信号量被全部占满——done 永远到不了 3 吗？
-	// 不对，全部 3 个都 done=3，会 happy return。
-	//
-	// 真正的 deadlock 场景：tester 内部忽略 ctx.Done()，永远阻塞。
-	// 简化方案：tester 立即返回 error（happy done），但 done 计数不增加——
-	// 用 skipTester 模拟"sem 满的 5 个"也算"deadline 路径"。
-	//
-	// 测一个混合场景：3 个 fast（done） + 2 个 sem-full（done via default）= 5 done
 	bt := &skipTester{}
 	srv, _, _ := newTestServer(t, withTester(bt), withCfg(func(c *Config) {
 		c.Concurrency = 3
@@ -305,8 +296,7 @@ func TestTestConcurrentGlobalDeadline(t *testing.T) {
 	}
 	done := 0
 	for _, it := range items {
-		// #6 起 "skipped" 也是合法终态（sem-full 跳过），并非 bug
-		if it.status == "alive" || it.status == "dead" || it.status == "skipped" {
+		if st, _, _, _ := it.snapshot(); st == "alive" || st == "dead" || st == "skipped" {
 			done++
 		}
 	}
@@ -315,40 +305,86 @@ func TestTestConcurrentGlobalDeadline(t *testing.T) {
 	}
 }
 
-// TestTestConcurrentSkipsWhenSemFull：信号量满时多余节点被立即标记 skipped，留待下轮再测。
-// 关键回归（#6）：sem-full 节点 *不能* 被标 dead —— 否则 checkOnce 会批量误删。
-func TestTestConcurrentSkipsWhenSemFull(t *testing.T) {
-	// 用一个让 goroutine 抢到信号量后阻塞 200ms 的 tester，
-	// 确保 sem 在 200ms 内始终被 2 个 goroutine 占住，
-	// 剩余 3 个 goroutine 必然走到 default 分支。
-	slowT := &slowBlockTester{hold: 200 * time.Millisecond}
-	srv, _, _ := newTestServer(t, withTester(slowT), withCfg(func(c *Config) {
+// TestTestConcurrentAllItemsTested（#8 回归）：worker-pool 下全量节点都会被真实测完，
+// 无论节点数是否大于 Concurrency——v0.1.6 及之前 sem-full 跳过导致每轮只随机测
+// Concurrency 个节点，其余瞬间 skipped，大库永远测不完。
+func TestTestConcurrentAllItemsTested(t *testing.T) {
+	srv, _, _ := newTestServer(t, withTester(&slowBlockTester{hold: 30 * time.Millisecond}),
+		withCfg(func(c *Config) {
+			c.Concurrency = 2 // 远小于节点数
+			c.TestTimeout = 1 * time.Second
+		}))
+	items := makeItems(7)
+	srv.testConcurrent(context.Background(), items)
+	for _, it := range items {
+		st, _, detail, _ := it.snapshot()
+		if st != "alive" {
+			t.Fatalf("worker-pool must test every item, got status=%q detail=%q", st, detail)
+		}
+	}
+}
+
+// TestTestConcurrentDeadlineMarksSkipped（#6 期望 1 回归）：全局 deadline 截断时，
+// 在飞测试返回 ctx 错误 → skipped（保留节点），绝不能被标 dead；
+// 排队未开始的 item 保持 pending，同样保留。
+func TestTestConcurrentDeadlineMarksSkipped(t *testing.T) {
+	// blockTester 尊重 ctx：deadline 后在飞测试快速返回 ctx.Err()，
+	// testItem 应把它归为 skipped 而非 dead。
+	bt := &blockTester{}
+	srv, _, _ := newTestServer(t, withTester(bt), withCfg(func(c *Config) {
 		c.Concurrency = 2
+		c.TestTimeout = 50 * time.Millisecond
+	}))
+	items := makeItems(6)
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer parentCancel()
+	srv.testConcurrent(parentCtx, items)
+	for i, it := range items {
+		st, _, _, _ := it.snapshot()
+		if st == "dead" {
+			t.Fatalf("item %d marked dead on deadline truncation (#6 regression)", i)
+		}
+		if st != "skipped" && st != "pending" {
+			t.Fatalf("item %d: unexpected status %q", i, st)
+		}
+	}
+}
+
+// TestTestConcurrentDeadlineLeavesPending：全局 deadline 触发时未测到的 item
+// 必须保持 status 原值（"pending" / "skipped"），绝不能被默默标 dead（#6 误删源头 ②）。
+//
+// 构造思路：用一个忽略 ctx 永久阻塞的 tester，模拟 sing-box 内部 syscall 泄漏；
+// 配合短 deadline 父 ctx 强制触发 testConcurrent 的全局 deadline 分支返回。
+// 此时只有拿到 worker 的极少数 goroutine 进入 tester.Test 并永远卡住；
+// 其它仍处于 pending —— 都不应被标 dead。
+func TestTestConcurrentDeadlineLeavesPending(t *testing.T) {
+	ht := &hangTester{}
+	srv, _, _ := newTestServer(t, withTester(ht), withCfg(func(c *Config) {
 		c.TestTimeout = 1 * time.Second
+		c.Concurrency = 2
 	}))
 	items := makeItems(5)
-	srv.testConcurrent(context.Background(), items)
-	skipped := 0
-	alive := 0
+	// 短 deadline 父 ctx → testCtx 的 min(parent_deadline, 计算值) 触发前者
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer parentCancel()
+	done := make(chan struct{})
+	go func() {
+		srv.testConcurrent(parentCtx, items)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatalf("testConcurrent didn't return after global deadline")
+	}
+	dead := 0
 	for _, it := range items {
-		switch it.status {
-		case "alive":
-			alive++
-		case "skipped":
-			skipped++
+		if st, _, _, _ := it.snapshot(); st == "dead" {
+			dead++
 		}
 	}
-	if skipped == 0 {
-		t.Fatalf("expected some skipped, got alive=%d skipped=%d", alive, skipped)
-	}
-	if alive+skipped != 5 {
-		t.Fatalf("alive+skipped != 5: alive=%d skipped=%d", alive, skipped)
-	}
-	// 防回归（#6）：任何 item 都不应被标 "dead"，否则会被 checkOnce 当 dead 删。
-	for _, it := range items {
-		if it.status == "dead" {
-			t.Fatalf("sem-full item marked dead (v0.1.5 #6 regression): %+v", it)
-		}
+	if dead > 0 {
+		t.Fatalf("deadline-residual items marked dead (v0.1.5 #6 regression): %d/5 dead", dead)
 	}
 }
 
@@ -426,44 +462,6 @@ func makeNodes(store *Store, n int) {
 	}
 }
 
-// TestTestConcurrentDeadlineLeavesPending：全局 deadline 触发时未测到的 item
-// 必须保持 status 原值（"pending" / "skipped"），绝不能被默默标 dead（#6 误删源头 ②）。
-//
-// 构造思路：用一个忽略 ctx 永久阻塞的 tester，模拟 sing-box 内部 syscall 泄漏；
-// 配合短 deadline 父 ctx 强制触发 testConcurrent 的全局 deadline 分支返回。
-// 此时只有拿到 sem 的极少数 goroutine 进入 tester.Test 并永远卡住；
-// 其它要么走 sem-full default 分支，要么处于 pending —— 都不应被标 dead。
-func TestTestConcurrentDeadlineLeavesPending(t *testing.T) {
-	ht := &hangTester{}
-	srv, _, _ := newTestServer(t, withTester(ht), withCfg(func(c *Config) {
-		c.TestTimeout = 1 * time.Second
-		c.Concurrency = 2
-	}))
-	items := makeItems(5)
-	// 短 deadline 父 ctx → testCtx 的 min(parent_deadline, now+30.15s) 触发前者
-	parentCtx, parentCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer parentCancel()
-	done := make(chan struct{})
-	go func() {
-		srv.testConcurrent(parentCtx, items)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("testConcurrent didn't return after global deadline")
-	}
-	dead := 0
-	for _, it := range items {
-		if it.status == "dead" {
-			dead++
-		}
-	}
-	if dead > 0 {
-		t.Fatalf("deadline-residual items marked dead (v0.1.5 #6 regression): %d/5 dead", dead)
-	}
-}
-
 // hangTester 永远阻塞，忽略 ctx —— 模拟 sing-box 内部 syscall 泄漏（#5/#6 复现）。
 // 测试结束由 Go runtime 清理泄漏 goroutine。
 type hangTester struct{}
@@ -485,7 +483,7 @@ func TestCheckOnceAbortsOnMassDeath(t *testing.T) {
 	)
 	makeNodes(store, 100)
 	before, _ := store.Count()
-	total, alive, dead := srv.checkOnce(context.Background())
+	total, alive, dead, _ := srv.checkOnce(context.Background())
 	after, _ := store.Count()
 	if after != before {
 		t.Fatalf("mass-death should NOT delete any rows: before=%d after=%d (dead=%d alive=%d total=%d)",
@@ -507,7 +505,7 @@ func TestCheckOnceNormalDelete(t *testing.T) {
 		}),
 	)
 	makeNodes(store, 10)
-	total, alive, dead := srv.checkOnce(context.Background())
+	total, alive, dead, _ := srv.checkOnce(context.Background())
 	if total != 10 {
 		t.Fatalf("total=%d want 10", total)
 	}

@@ -48,7 +48,7 @@ func (n *Node) toVmessURI() string {
 		"id":   n.UUID,
 		"aid":  strconv.Itoa(n.AlterID),
 		"net":  orDefault(n.Network, "tcp"),
-		"type": "none",
+		"type": orDefault(n.HeaderType, "none"),
 	}
 	if n.TLS {
 		v["tls"] = "tls"
@@ -97,6 +97,10 @@ func (n *Node) toVlessURI() string {
 	}
 	if n.Path != "" {
 		q.Set("path", n.Path)
+	}
+	// tcp+http 头伪装（联通绿通等，见 #7）：headerType 参数完整往返
+	if n.HeaderType != "" && n.HeaderType != "none" {
+		q.Set("headerType", n.HeaderType)
 	}
 	if n.Service != "" {
 		q.Set("serviceName", n.Service)
@@ -471,6 +475,20 @@ func writeClashFields(w *yamlWriter, n *Node) {
 	}
 
 	// 传输层
+	if (n.Network == "tcp" || n.Network == "") && n.HeaderType == "http" &&
+		(n.Protocol == "vmess" || n.Protocol == "vless") {
+		// v2ray tcp+HTTP 头伪装（联通绿通等，见 #7）：mihomo 用 network: http + http-opts 表达
+		w.kv(ind, "network", "http")
+		w.line(ind, "http-opts:")
+		w.kv(ind+1, "method", "GET")
+		w.line(ind+1, "path:")
+		w.line(ind+2, "- "+yamlQuote(orDefault(n.Path, "/")))
+		if n.Host != "" {
+			w.line(ind+1, "headers:")
+			w.line(ind+2, "Host:")
+			w.line(ind+3, "- "+yamlQuote(n.Host))
+		}
+	}
 	switch n.Network {
 	case "ws":
 		w.kv(ind, "network", "ws")

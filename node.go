@@ -34,10 +34,11 @@ type Node struct {
 	Insecure   bool              `json:"insecure,omitempty"`
 	SNI        string            `json:"sni,omitempty"`
 	PinSHA256  string            `json:"pin_sha256,omitempty"` // 证书 SPKI SHA256 指纹（hex），hysteria2 pinSHA256
-	FP         string            `json:"fp,omitempty"` // 指纹
+	FP         string            `json:"fp,omitempty"`         // 指纹
 	ALPN       []string          `json:"alpn,omitempty"`
-	Network    string            `json:"network,omitempty"` // tcp / ws / grpc / h2
-	Host       string            `json:"host,omitempty"`    // ws / h2 的 Host
+	Network    string            `json:"network,omitempty"`     // tcp / ws / grpc / h2
+	HeaderType string            `json:"header_type,omitempty"` // tcp 传输的伪装头类型（http = v2ray headerType=http，见 #7）
+	Host       string            `json:"host,omitempty"`        // ws / h2 的 Host
 	Path       string            `json:"path,omitempty"`
 	Service    string            `json:"service_name,omitempty"` // grpc
 	Header     map[string]string `json:"header,omitempty"`       // ws 自定义头
@@ -207,6 +208,10 @@ func parseVmess(rest, raw string) (*Node, error) {
 		SNI:      orDefault(v.SNI, v.Host),
 		FP:       v.FP,
 	}
+	// vmess JSON 的 "type" 字段在 net=tcp 时是伪装头类型（"http" = HTTP 头伪装，见 #7）
+	if n.Network == "tcp" && v.Type != "" && v.Type != "none" {
+		n.HeaderType = v.Type
+	}
 	if aid, err := strconv.Atoi(v.Aid); err == nil {
 		n.AlterID = aid
 	}
@@ -244,6 +249,9 @@ func parseVmessLegacy(rest, raw string) (*Node, error) {
 			n.FP = vals.Get("fp")
 			n.TLS = truthy(vals.Get("tls"))
 			n.Insecure = truthy(vals.Get("allowInsecure")) || truthy(vals.Get("insecure"))
+			if ht := vals.Get("headerType"); ht != "" && ht != "none" {
+				n.HeaderType = ht
+			}
 		}
 		if n.Network == "" {
 			n.Network = "tcp"
@@ -273,6 +281,10 @@ func parseVless(raw string) (*Node, error) {
 	n.Network = orDefault(q.Get("type"), "tcp")
 	n.Host = q.Get("host")
 	n.Path = q.Get("path")
+	// headerType=http：v2ray 的 tcp 传输 HTTP 头伪装（联通绿通等场景，见 #7）
+	if ht := q.Get("headerType"); ht != "" && ht != "none" {
+		n.HeaderType = ht
+	}
 	if q.Get("serviceName") != "" {
 		n.Service = q.Get("serviceName")
 	} else if n.Network == "grpc" {

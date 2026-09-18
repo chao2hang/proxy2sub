@@ -9,7 +9,8 @@
 ## 特性
 
 - **推送即测活**：`POST /api/push` 收到线路后经 sing-box 真实建连访问测活目标，只有活着的线路才入库
-- **周期复测**：后台定时全量测活，失效线路自动删除，存活线路刷新延迟
+- **周期复测**：后台定时全量测活（worker-pool，每轮所有节点都会被真实测完），失效线路自动删除，存活线路刷新延迟
+- **联通绿通支持**：`vless+tcp` HTTP 头伪装（`headerType=http`）与 `vmess+ws` host 伪装节点可正常测活（见[测活机制](#测活机制与限制)）
 - **国家识别**：按服务器 IP 解析国家（支持本地 mmdb 离线库，缺省走 ip-api.com 在线批量接口）
 - **规范命名**：`US_8.8.8.8` 形式，域名服务器先解析为 IP 再命名
 - **订阅输出**：`GET /sub` 按 `Accept`/`User-Agent` 自动返回 Clash YAML 或 v2ray base64，Clash 中按国家生成 `proxy-groups`
@@ -99,10 +100,13 @@ curl -X POST http://127.0.0.1:8080/api/push \
   "invalid": 0,
   "duplicates": 0,
   "alive": 1,
-  "dead": 3,
+  "dead": 2,
+  "skipped": 1,
   "added": 1
 }
 ```
+
+`skipped` 表示本轮未完成测活的线路（全局 deadline 截断 / 暂不支持的传输配置），不会入库也不计入 dead，重新推送即可重测。
 
 加 `?detail=1` 可查看每条线路的处理结果（含失败原因、延迟、命名）。
 
@@ -128,8 +132,8 @@ v2rayN / Clash 客户端的订阅地址均填写：`http://<host>:<port>/sub`
 | `POST /api/push` | 批量推送节点（详见下文） |
 | `POST /api/check` | 手动触发一轮周期测活（同步返回结果，`?sync=0` 异步立即 202） |
 | `GET /sub` | 订阅输出（v2ray URI / Clash YAML，按 `Accept` / `?format=` 选择） |
-| `GET /api/stats` | 节点总数、按国家/协议统计 |
-| `GET /healthz` | 健康检查 |
+| `GET /api/stats` | 节点总数、按国家/协议统计、goroutine 数 |
+| `GET /healthz` | 健康检查（节点数 + goroutine 数，goroutine 线性上涨提示测活泄漏） |
 
 ## 配置（环境变量）
 
@@ -143,7 +147,7 @@ v2rayN / Clash 客户端的订阅地址均填写：`http://<host>:<port>/sub`
 | `PROXY2SUB_CHECK_ON_START` | `false` | 启动 3 秒后先跑一轮测活；周期任务自带 panic recover，畸形节点不会杀死 ticker goroutine |
 | `PROXY2SUB_TEST_TIMEOUT` | `8s` | 单节点测活超时 |
 | `PROXY2SUB_TEST_URL` | `http://www.gstatic.com/generate_204` | 测活目标（经代理访问） |
-| `PROXY2SUB_CONCURRENCY` | `20` | 测活并发数；大于节点数时所有节点都能测试；小于节点数时多余的会被本轮标记 `skipped`（不影响存活判定） |
+| `PROXY2SUB_CONCURRENCY` | `20` | 测活并发数（worker-pool worker 数）。每轮会全量测完所有节点，一轮耗时约 `⌈N/并发⌉ × 超时`；节点数较大（>500）时可调大该值缩短单轮耗时 |
 | `PROXY2SUB_MAX_DEAD_RATIO` | `50` | 单轮删除熔断阈值（百分比）。`dead/total` 超过该值时中止本轮删除并告警，避免类似 #6 类批量误删灾难。设 `0` 禁用熔断。仅在 `total >= 20` 时生效 |
 | `PROXY2SUB_GEOIP_DB` | 空 | 本地 mmdb 文件路径（缺省读取同目录 `Country.mmdb`，都没有则用 ip-api.com 在线接口） |
 
@@ -165,6 +169,17 @@ curl -L -o Country.mmdb https://github.com/Loyalsoldier/geoip/releases/latest/do
 - 构建必须带 `-tags "with_utls with_quic"`：Reality 需要 uTLS、Hysteria/Hysteria2 需要 QUIC，缺 tag 时这两类节点会全部误判 dead
 - `hysteria://`（v1，`?auth=` 格式）与 `hy2://`/`hysteria2://`（v2）均支持；推送响应的 `reason` 字段区分 `dead`（节点本身不可用）与 `unreachable`（环境不可达，如超时、无 IPv6 路由）
 - 支持 `anytls://` 协议（Clash/mihomo 订阅中常见），解析后经 sing-box 原生 anytls outbound 测活，订阅输出（v2ray URI / Clash YAML）完整往返
+
+### 测活机制与限制
+
+| 场景 | 行为 |
+| --- | --- |
+| 常规协议与传输层（ws/grpc/h2/reality 等） | sing-box 真实建连访问测活目标 |
+| `vless+tcp` + `headerType=http`（联通绿通等 HTTP 头伪装） | sing-box 无此传输，p2s 内置轻量 VLESS+HTTP-obfs 探测器（伪装请求 + VLESS 握手 + 隧道内 HTTP GET，支持 tcp / tcp+tls） |
+| `vmess+tcp` + `headerType=http` | 协议加密无法在 p2s 内独立握手，标 `skipped` 保留（不判 dead、不入库） |
+| 测活卡死（sing-box 内部 syscall 不响应取消） | 看门狗在 `2×超时` 后强制关闭 sing-box 实例，goroutine 得以退出，不泄漏内存（v0.1.7 修复 #9） |
+| 全局 deadline 截断 / 单节点 deadline | 节点标 `skipped` 保留原状态，下轮重测；**绝不因超时截断判 dead**（#6） |
+| 单轮 `dead/total` 超过 `PROXY2SUB_MAX_DEAD_RATIO` | 熔断：整轮不删除，仅刷新存活元数据并告警 |
 
 ## 开发
 
